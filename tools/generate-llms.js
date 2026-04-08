@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-
+// Temporarily disabled for Vercel build
+   process.exit(0);
 import fs from 'fs';
 import path from 'path';
 
