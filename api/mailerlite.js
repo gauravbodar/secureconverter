@@ -1,3 +1,10 @@
+/**
+ * /api/mailerlite — Waitlist signup handler
+ *
+ * Routes handled:
+ *   POST /api/mailerlite  (also rewritten from /api/mailerlite-signup via vercel.json)
+ */
+
 import { setCors } from './middleware/corsHeaders.js';
 import { signupLimiter } from './middleware/rateLimit.js';
 import { addSubscriber } from './lib/mailerlite.js';
@@ -8,10 +15,8 @@ export default async function handler(req, res) {
   if (setCors(req, res)) return;
   if (req.method !== 'POST') return Errors.METHOD_NOT_ALLOWED(res);
 
-  // Rate limit
-  let limited = false;
-  signupLimiter(req, res, () => { limited = false; });
-  if (limited) return;
+  await new Promise((resolve) => signupLimiter(req, res, resolve));
+  if (res.headersSent) return;
 
   const { email, firstName } = req.body || {};
 
@@ -34,7 +39,7 @@ export default async function handler(req, res) {
         : 'Successfully added to the waitlist!',
     });
   } catch (err) {
-    console.error('[mailerlite-signup]', err);
+    console.error('[api/mailerlite]', err);
     return Errors.INTERNAL(res);
   }
 }

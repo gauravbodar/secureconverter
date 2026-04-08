@@ -1,27 +1,24 @@
 /**
- * POST /api/conversion/convert
+ * /api/conversion — Consolidated conversion handler
  *
- * Accepts multipart/form-data with a 'file' field (PDF).
- * Returns CSV as application/octet-stream, or 403 if daily limit is reached.
+ * Routes handled:
+ *   POST /api/conversion/convert   (multipart PDF → CSV)
  *
- * Auth: Optional JWT. Authenticated users get their quota tracked by userId;
- *       anonymous users are tracked by IP.
- *
- * Free tier: 3 conversions per day per IP (anon) or 10 per month (pro plan).
+ * bodyParser is disabled so formidable can handle multipart uploads.
  */
 
 import formidable from 'formidable';
 import { readFile, unlink } from 'fs/promises';
-import { setCors } from '../middleware/corsHeaders.js';
-import { optionalAuth } from '../middleware/auth.js';
-import { conversionLimiter } from '../middleware/rateLimit.js';
-import { parsePDFToCSV } from '../lib/pdf-parser.js';
-import { supabase } from '../lib/supabase.js';
-import { Errors } from '../utils/response.js';
+import { setCors } from './middleware/corsHeaders.js';
+import { optionalAuth } from './middleware/auth.js';
+import { conversionLimiter } from './middleware/rateLimit.js';
+import { parsePDFToCSV } from './lib/pdf-parser.js';
+import { supabase } from './lib/supabase.js';
+import { Errors } from './utils/response.js';
 
 export const config = { api: { bodyParser: false } };
 
-const FREE_DAILY_LIMIT = 3; // conversions per IP per day
+const FREE_DAILY_LIMIT = 3;
 
 function getClientIP(req) {
   return (
@@ -33,7 +30,7 @@ function getClientIP(req) {
 }
 
 async function checkAndIncrementQuota(userId, ip) {
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const today = new Date().toISOString().slice(0, 10);
   const key   = userId || ip;
 
   const { data: quota } = await supabase
@@ -60,10 +57,7 @@ async function checkAndIncrementQuota(userId, ip) {
   return { allowed: true, count: quota.count + 1 };
 }
 
-export default async function handler(req, res) {
-  if (setCors(req, res)) return;
-  if (req.method !== 'POST') return Errors.METHOD_NOT_ALLOWED(res);
-
+async function handleConvert(req, res) {
   // Optional auth
   let user = null;
   await new Promise((resolve) => optionalAuth(req, res, () => { user = req.user; resolve(); }));
@@ -74,11 +68,11 @@ export default async function handler(req, res) {
 
   // Parse multipart
   const form = formidable({ maxFileSize: 10 * 1024 * 1024, keepExtensions: true });
-  let fields, files;
+  let files;
   try {
-    [fields, files] = await form.parse(req);
+    [, files] = await form.parse(req);
   } catch (err) {
-    if (err.code === 1016 /* formidable FILE_TOO_LARGE */) return Errors.FILE_TOO_LARGE(res);
+    if (err.code === 1016) return Errors.FILE_TOO_LARGE(res);
     console.error('[conversion/convert] parse error:', err);
     return Errors.INTERNAL(res, 'Failed to read uploaded file.');
   }
@@ -88,7 +82,6 @@ export default async function handler(req, res) {
     return res.status(400).json({ success: false, error: 'No file uploaded.', code: 'NO_FILE' });
   }
 
-  // Validate MIME
   if (uploadedFile.mimetype !== 'application/pdf') {
     await unlink(uploadedFile.filepath).catch(() => {});
     return Errors.INVALID_FILE_TYPE(res);
@@ -96,7 +89,6 @@ export default async function handler(req, res) {
 
   const ip = getClientIP(req);
 
-  // Quota check (anonymous users only; authenticated users have separate quota)
   if (!user) {
     const quota = await checkAndIncrementQuota(null, ip);
     if (!quota.allowed) {
@@ -105,7 +97,6 @@ export default async function handler(req, res) {
     }
   }
 
-  // Read and parse
   let buffer;
   try {
     buffer = await readFile(uploadedFile.filepath);
@@ -124,17 +115,16 @@ export default async function handler(req, res) {
 
   const conversionTimeMs = Date.now() - startMs;
 
-  // Log conversion to Supabase (best-effort)
+  // Log (best-effort)
   supabase.from('conversions').insert({
-    user_id:          user?.userId || null,
-    filename:         uploadedFile.originalFilename || 'statement.pdf',
-    file_size:        uploadedFile.size,
-    bank_type:        parsed.bank,
+    user_id:            user?.userId || null,
+    filename:           uploadedFile.originalFilename || 'statement.pdf',
+    file_size:          uploadedFile.size,
+    bank_type:          parsed.bank,
     conversion_time_ms: conversionTimeMs,
-    status:           'success',
+    status:             'success',
   }).then(() => {}).catch(() => {});
 
-  // Update authenticated user's monthly conversion count
   if (user?.userId) {
     supabase.rpc('increment_conversion_count', { uid: user.userId }).then(() => {}).catch(() => {});
   }
@@ -147,4 +137,24 @@ export default async function handler(req, res) {
   res.setHeader('X-Bank-Type', parsed.bank);
   res.setHeader('X-Row-Count', String(parsed.rowCount));
   res.status(200).end(parsed.csv);
+}
+
+// ── main handler ──────────────────────────────────────────────────────────────
+
+export default async function handler(req, res) {
+  if (setCors(req, res)) return;
+
+  const path = new URL(req.url, 'http://localhost').pathname;
+
+  try {
+    if (req.method === 'POST' && path.endsWith('/convert')) {
+      return await handleConvert(req, res);
+    }
+
+    return Errors.METHOD_NOT_ALLOWED(res);
+
+  } catch (err) {
+    console.error('[api/conversion]', err);
+    return Errors.INTERNAL(res);
+  }
 }

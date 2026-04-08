@@ -3,17 +3,21 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/conversion/convert.js": {
+    "api/conversion.js": {
       "maxDuration": 30,
       "memory": 1024
     },
-    "api/payment/webhook.js": {
-      "maxDuration": 10
+    "api/payment.js": {
+      "maxDuration": 15
     }
   },
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/$1" },
-    { "source": "/(.*)",     "destination": "/index.html" }
+    { "source": "/api/auth/:path*",        "destination": "/api/auth" },
+    { "source": "/api/conversion/:path*",  "destination": "/api/conversion" },
+    { "source": "/api/user/:path*",        "destination": "/api/user" },
+    { "source": "/api/payment/:path*",     "destination": "/api/payment" },
+    { "source": "/api/mailerlite-signup",  "destination": "/api/mailerlite" },
+    { "source": "/(.*)",                   "destination": "/index.html" }
   ],
   "headers": [
     {
