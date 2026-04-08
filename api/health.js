@@ -1,4 +1,4 @@
-import { setCors } from './middleware/corsHeaders.js';
+import { setCors } from '../middleware/corsHeaders.js';
 
 export default function handler(req, res) {
   if (setCors(req, res)) return;

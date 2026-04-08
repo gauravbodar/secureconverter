@@ -9,11 +9,11 @@
  * needed for Stripe signature verification. The checkout route parses JSON manually.
  */
 
-import { setCors } from './middleware/corsHeaders.js';
-import { requireAuth } from './middleware/auth.js';
-import { stripe, PLANS } from './lib/stripe.js';
-import { supabase } from './lib/supabase.js';
-import { success, Errors } from './utils/response.js';
+import { setCors } from '../middleware/corsHeaders.js';
+import { requireAuth } from '../middleware/auth.js';
+import { stripe, PLANS } from '../lib/stripe.js';
+import { supabase } from '../lib/supabase.js';
+import { success, Errors } from '../utils/response.js';
 
 export const config = { api: { bodyParser: false } };
 

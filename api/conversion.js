@@ -9,12 +9,12 @@
 
 import formidable from 'formidable';
 import { readFile, unlink } from 'fs/promises';
-import { setCors } from './middleware/corsHeaders.js';
-import { optionalAuth } from './middleware/auth.js';
-import { conversionLimiter } from './middleware/rateLimit.js';
-import { parsePDFToCSV } from './lib/pdf-parser.js';
-import { supabase } from './lib/supabase.js';
-import { Errors } from './utils/response.js';
+import { setCors } from '../middleware/corsHeaders.js';
+import { optionalAuth } from '../middleware/auth.js';
+import { conversionLimiter } from '../middleware/rateLimit.js';
+import { parsePDFToCSV } from '../lib/pdf-parser.js';
+import { supabase } from '../lib/supabase.js';
+import { Errors } from '../utils/response.js';
 
 export const config = { api: { bodyParser: false } };
 

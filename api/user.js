@@ -7,13 +7,13 @@
  *   POST /api/user/unlock
  */
 
-import { setCors } from './middleware/corsHeaders.js';
-import { requireAuth } from './middleware/auth.js';
-import { signupLimiter } from './middleware/rateLimit.js';
-import { supabase } from './lib/supabase.js';
-import { addSubscriber } from './lib/mailerlite.js';
-import { isValidEmail, normalizeEmail } from './utils/validators.js';
-import { success, Errors } from './utils/response.js';
+import { setCors } from '../middleware/corsHeaders.js';
+import { requireAuth } from '../middleware/auth.js';
+import { signupLimiter } from '../middleware/rateLimit.js';
+import { supabase } from '../lib/supabase.js';
+import { addSubscriber } from '../lib/mailerlite.js';
+import { isValidEmail, normalizeEmail } from '../utils/validators.js';
+import { success, Errors } from '../utils/response.js';
 
 const PLAN_LIMITS  = { free: 10, pro: Infinity };
 const UNLOCK_BONUS = 10;

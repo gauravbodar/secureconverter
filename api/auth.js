@@ -8,12 +8,12 @@
  */
 
 import bcrypt from 'bcryptjs';
-import { setCors } from './middleware/corsHeaders.js';
-import { authLimiter } from './middleware/rateLimit.js';
-import { supabase } from './lib/supabase.js';
-import { signToken, verifyToken } from './lib/jwt.js';
-import { isValidEmail, isValidPassword, isValidName, normalizeEmail } from './utils/validators.js';
-import { success, Errors } from './utils/response.js';
+import { setCors } from '../middleware/corsHeaders.js';
+import { authLimiter } from '../middleware/rateLimit.js';
+import { supabase } from '../lib/supabase.js';
+import { signToken, verifyToken } from '../lib/jwt.js';
+import { isValidEmail, isValidPassword, isValidName, normalizeEmail } from '../utils/validators.js';
+import { success, Errors } from '../utils/response.js';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 

@@ -5,11 +5,11 @@
  *   POST /api/mailerlite  (also rewritten from /api/mailerlite-signup via vercel.json)
  */
 
-import { setCors } from './middleware/corsHeaders.js';
-import { signupLimiter } from './middleware/rateLimit.js';
-import { addSubscriber } from './lib/mailerlite.js';
-import { isValidEmail, isValidName, normalizeEmail } from './utils/validators.js';
-import { success, Errors } from './utils/response.js';
+import { setCors } from '../middleware/corsHeaders.js';
+import { signupLimiter } from '../middleware/rateLimit.js';
+import { addSubscriber } from '../lib/mailerlite.js';
+import { isValidEmail, isValidName, normalizeEmail } from '../utils/validators.js';
+import { success, Errors } from '../utils/response.js';
 
 export default async function handler(req, res) {
   if (setCors(req, res)) return;
