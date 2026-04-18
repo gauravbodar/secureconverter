@@ -112,35 +112,87 @@ def extract_header_info(pdf):
         info['bank'] = 'Unknown'
     return info
 
-def extract_rows_by_position(page):
+def detect_column_boundaries(page):
     """
-    Extract transaction rows using word x/y positions.
-    Used instead of extract_table() because NAB PDFs have no ruled borders.
-    Groups words by y-coordinate into lines, then splits each line
-    into 5 columns by x-coordinate thresholds.
+    Find the header row containing Date/Particulars/Debits/Credits/Balance
+    and return the x-midpoints between columns.
+    Works for any bank — no hardcoded positions.
+    Returns dict: {date_max, part_max, debt_max, cred_max}
+    or None if no header row found on this page.
     """
+    words = page.extract_words(x_tolerance=3, y_tolerance=3)
+
+    # Find words that are column headers
+    HEADER_WORDS = {
+        'date': ['date'],
+        'particulars': ['particulars', 'description', 'details', 'transaction'],
+        'debits': ['debits', 'debit', 'withdrawals', 'withdrawal'],
+        'credits': ['credits', 'credit', 'deposits', 'deposit'],
+        'balance': ['balance']
+    }
+
+    found = {}
+    for word in words:
+        t = word['text'].lower().strip('.,: ')
+        for col, variants in HEADER_WORDS.items():
+            if t in variants and col not in found:
+                found[col] = float(word['x0'])
+
+    # Need at least date + one amount column to proceed
+    if 'date' not in found or 'balance' not in found:
+        return None
+
+    # Build boundaries as midpoints between column header positions
+    cols = {}
+    if 'date' in found:
+        cols['date'] = found['date']
+    if 'particulars' in found:
+        cols['part'] = found['particulars']
+    if 'debits' in found:
+        cols['debt'] = found['debits']
+    if 'credits' in found:
+        cols['cred'] = found['credits']
+    if 'balance' in found:
+        cols['bal'] = found['balance']
+
+    # Midpoints between adjacent columns
+    date_max = (cols.get('date', 0) + cols.get('part', cols.get('date', 0) + 60)) / 2 + 20
+    part_max = (cols.get('part', 100) + cols.get('debt', cols.get('part', 100) + 250)) / 2 + 10
+    debt_max = (cols.get('debt', 350) + cols.get('cred', cols.get('debt', 350) + 70)) / 2 + 5
+    cred_max = (cols.get('cred', 430) + cols.get('bal', cols.get('cred', 430) + 70)) / 2 + 5
+
+    return {
+        'date_max': date_max,
+        'part_max': part_max,
+        'debt_max': debt_max,
+        'cred_max': cred_max
+    }
+
+
+def extract_rows_by_position(page, boundaries):
+    """
+    Extract rows using dynamically detected column boundaries.
+    boundaries comes from detect_column_boundaries() — no hardcoding.
+    """
+    if not boundaries:
+        return []
+
+    DATE_MAX = boundaries['date_max']
+    PART_MAX = boundaries['part_max']
+    DEBT_MAX = boundaries['debt_max']
+    CRED_MAX = boundaries['cred_max']
+
     words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
     if not words:
         return []
 
-    # Group words into lines by y-position (snap to 3pt grid)
+    # Group words into lines by y-position
     lines = {}
     for word in words:
         y = round(float(word['top']) / 3) * 3
         if y not in lines:
             lines[y] = []
         lines[y].append(word)
-
-    # NAB column x-boundaries (points from left edge of page)
-    # Date column:        x < 80
-    # Particulars column: 80 <= x < 350
-    # Debits column:      350 <= x < 430
-    # Credits column:     430 <= x < 510
-    # Balance column:     x >= 510
-    DATE_MAX = 100    # Date words end at x=76
-    PART_MAX = 365    # Particulars end ~x=285, debits start at x=371
-    DEBT_MAX = 430    # Debits end ~x=380, credits start at x=435
-    CRED_MAX = 498    # Credits end ~x=442, balance starts at x=501
 
     rows = []
     for y in sorted(lines.keys()):
@@ -215,10 +267,18 @@ def parse():
             year = extract_statement_year(pdf)
             header_info = extract_header_info(pdf)
             last_date = None
+            last_known_boundaries = None
 
             for page in pdf.pages:
-                # Use position-based extraction — NAB has no ruled table borders
-                table = extract_rows_by_position(page)
+                # Detect columns from header row — works for any bank
+                boundaries = detect_column_boundaries(page)
+                if not boundaries:
+                    # No header on this page — reuse last known boundaries
+                    boundaries = last_known_boundaries
+                else:
+                    last_known_boundaries = boundaries
+
+                table = extract_rows_by_position(page, boundaries)
                 if not table:
                     continue
 
@@ -245,6 +305,11 @@ def parse():
                     debit_raw  = cells[2] if len(cells) > 2 else ''
                     credit_raw = cells[3] if len(cells) > 3 else ''
                     bal_raw    = cells[4] if len(cells) > 4 else ''
+
+                    # Generic description cleaning (all banks)
+                    desc = re.sub(r'\.{3,}.*$', '', desc).strip()   # strip trailing dot leaders
+                    desc = re.sub(r'^\d{4}\s+', '', desc).strip()    # strip leading year prefix
+                    desc = re.sub(r'\s+(Dr|Cr)$', '', desc).strip()  # strip trailing Dr/Cr suffix
 
                     # Parse date — inherit if blank
                     parsed_date = parse_date(date_raw, year)
