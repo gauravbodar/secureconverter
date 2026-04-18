@@ -1,29 +1,49 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { Download, CheckCircle, ArrowLeft, ExternalLink } from 'lucide-react';
+import { Download, CheckCircle, ArrowLeft, ExternalLink, AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
+
+function buildCSV(transactions) {
+  const rows = [['date', 'description', 'debit', 'credit', 'balance']];
+  for (const t of transactions) {
+    const desc = t.description ? `"${t.description.replace(/"/g, '""')}"` : '';
+    rows.push([
+      t.date || '',
+      desc,
+      t.debit  != null ? t.debit  : '',
+      t.credit != null ? t.credit : '',
+      t.balance != null ? t.balance : '',
+    ]);
+  }
+  return rows.map(r => r.join(',')).join('\n');
+}
 
 const ResultsPage = ({ conversionData, onBackHome }) => {
   const { toast } = useToast();
 
   const handleDownload = () => {
-    if (!conversionData) return;
+    if (!conversionData?.transactions?.length) return;
 
-    const url = window.URL.createObjectURL(conversionData.blob);
+    const csv = buildCSV(conversionData.transactions);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = conversionData.filename;
+    const baseName = (conversionData.originalFilename || 'statement').replace(/\.pdf$/i, '');
+    a.download = `${baseName}_converted.csv`;
     document.body.appendChild(a);
     a.click();
     window.URL.revokeObjectURL(url);
     document.body.removeChild(a);
 
     toast({
-      title: "Download Started! 📥",
+      title: "Download Started!",
       description: "Your CSV file is downloading now."
     });
   };
+
+  const v = conversionData?.validation || {};
 
   const handleXeroClick = () => {
     toast({
@@ -78,21 +98,47 @@ const ResultsPage = ({ conversionData, onBackHome }) => {
           transition={{ duration: 0.6, delay: 0.2 }}
           className="bg-white rounded-xl shadow-lg p-8 mb-8 border border-gray-200"
         >
-          <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center justify-between mb-4">
             <div>
               <h3 className="text-lg font-semibold text-[#1a2b48] mb-1">
                 {conversionData?.originalFilename || 'Bank Statement'}
               </h3>
               <p className="text-sm text-gray-600">
-                Converted • {conversionData?.pageCount || 0} pages processed
+                {conversionData?.bank || 'Bank'} &bull; {v.transactionCount || 0} transactions
+                {conversionData?.statementPeriod?.from && (
+                  <> &bull; {conversionData.statementPeriod.from} – {conversionData.statementPeriod.to}</>
+                )}
               </p>
             </div>
             <div className="text-right">
-              <span className="inline-block bg-green-100 text-green-800 text-xs font-semibold px-3 py-1 rounded-full">
-                Ready
-              </span>
+              {v.balanceChecks === true ? (
+                <span className="inline-flex items-center gap-1 bg-green-100 text-green-800 text-xs font-semibold px-3 py-1 rounded-full">
+                  <CheckCircle className="w-3 h-3" /> Balance verified
+                </span>
+              ) : v.balanceChecks === false ? (
+                <span className="inline-flex items-center gap-1 bg-yellow-100 text-yellow-800 text-xs font-semibold px-3 py-1 rounded-full">
+                  <AlertCircle className="w-3 h-3" /> Balance mismatch
+                </span>
+              ) : (
+                <span className="inline-block bg-green-100 text-green-800 text-xs font-semibold px-3 py-1 rounded-full">
+                  Ready
+                </span>
+              )}
             </div>
           </div>
+
+          {(v.sumCredits != null || v.sumDebits != null) && (
+            <div className="grid grid-cols-2 gap-3 mb-6 text-sm">
+              <div className="bg-green-50 rounded-lg p-3">
+                <p className="text-gray-500 text-xs mb-1">Total Credits</p>
+                <p className="font-semibold text-green-700">${v.sumCredits?.toLocaleString('en-AU', { minimumFractionDigits: 2 })}</p>
+              </div>
+              <div className="bg-red-50 rounded-lg p-3">
+                <p className="text-gray-500 text-xs mb-1">Total Debits</p>
+                <p className="font-semibold text-red-700">${v.sumDebits?.toLocaleString('en-AU', { minimumFractionDigits: 2 })}</p>
+              </div>
+            </div>
+          )}
 
           <Button
             onClick={handleDownload}

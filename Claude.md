@@ -1,7 +1,7 @@
 # CLAUDE.md — SecureStatementConverter
 ## Master Project Blueprint for Claude Code
 
-> **Treat this file as the single source of truth.** Every decision, output, and implementation must align with what is written here. Do not invent features, assumptions, or requirements without explicitly stating they are inferred. When in doubt, ask before building.
+> **Treat this file as the single source of truth.** Every decision, output, and implementation must align with what is written here. Do not invent features, assumptions, or requirements. When in doubt, ask before building.
 
 ---
 
@@ -9,283 +9,503 @@
 
 | Track | Product | Purpose |
 |-------|---------|---------|
-| **Track 2 (this repo)** | SecureStatementConverter | SaaS website — converts Australian bank PDF statements to CSV/XLSX/JSON |
-| **Track 1 (referenced)** | AI Agent Automation Service | Done-for-you AI agent builds — sold via the Enterprise tier of Track 2 |
+| **Track 2 (this repo)** | SecureStatementConverter | SaaS — converts Australian bank PDF statements to CSV/XLSX/JSON |
+| **Track 1 (referenced)** | AI Agent Automation Service | Done-for-you AI agent builds — sold via Enterprise tier of Track 2 |
 
-**The connection:** When a user selects **Enterprise** on SecureStatementConverter, they hit a **Book a Call** flow. That call leads to a proposal for the **AI Agent Automation Service** — a $3,000–$5,000 setup + $500–$1,000/month retainer engagement.
+**Enterprise connection:** Enterprise tier → "Book a Call" → AI Agent Automation Service proposal ($3,000–$5,000 setup + $500–$1,000/month retainer).
 
 ---
 
-## 1. Confirmed Tech Stack
+## 1. Brand Promise — NON-NEGOTIABLE
+
+**"Secure" is the entire brand.**
+
+- Australian bank statement data NEVER leaves our infrastructure
+- NO third-party parsing APIs (not bankstatementconverter.com, not OpenAI, not AWS Textract, nothing)
+- NO external service ever sees a user's PDF
+- Parsing runs 100% on our own servers using local Python libraries
+- This is a hard architectural constraint — never route PDFs externally
+
+---
+
+## 2. Confirmed Tech Stack
 
 | Layer | Technology | Notes |
 |-------|-----------|-------|
 | **Frontend** | React 18 + Vite | NOT Next.js. Entry: `index.html` + `src/` |
-| **Styling** | Tailwind CSS 3 + Radix UI + shadcn/ui | Components in `src/components/` |
+| **Styling** | Tailwind CSS 3 + Radix UI + shadcn/ui | Deep Navy Blue + White + Grey |
 | **Animation** | Framer Motion | Already in `package.json` |
 | **Icons** | lucide-react | Already in use |
-| **Backend** | Vercel Serverless Functions (JavaScript) | Files live in `/api/*.js` |
-| **Database** | Supabase | `@supabase/supabase-js` + migrations in `supabase/migrations/` |
+| **Frontend API calls** | Vercel Serverless (JS) | `/api/*.js` — auth, billing, quota, routing only |
+| **PDF Parsing** | Python + pdfplumber | Runs on Railway (separate microservice) |
+| **Parse routing** | `/api/convert.js` | Proxies PDF to Python service, returns JSON |
+| **Database** | Supabase | `@supabase/supabase-js`, RLS on all tables |
 | **Auth** | Supabase Auth | Email + password |
-| **PDF Parsing** | `pdf-parse` + `pdfjs-dist` | JavaScript only — do NOT introduce Python or pdfplumber |
-| **Payments** | Stripe (`stripe` v14) | Already installed |
-| **Deployment** | Vercel | `vercel.json` configured |
+| **Payments** | Stripe v14 | Already installed — only payment processor |
+| **Deployment — Frontend** | Vercel | `vercel.json` configured |
+| **Deployment — Parser** | Railway (Python) | Flask microservice, separate repo or `/parser` folder |
 | **Local path** | `C:\AWS\securestatement` | Claude Code working directory |
 
 ### Design System
-- **Primary:** Deep Navy Blue (`#0066cc` or equivalent dark navy)
-- **Background:** Crisp White (`#ffffff`)
-- **Accent:** Light Grey (`#f5f5f5`), Dark Grey (`#333333`)
-- **Tone:** Professional, trustworthy, minimalist
-- **Max-width:** 1200px, padding 4rem desktop / 2rem mobile
+- **Primary:** Deep Navy Blue (`#0A2342`)
+- **Background:** Crisp White (`#FFFFFF`)
+- **Accents:** Light Grey (`#F5F5F5`), Mid Grey (`#E0E0E0`)
+- **Max-width:** 1200px | Desktop padding: 4rem | Mobile: 2rem
 
 ---
 
-## 2. Repository Structure
+## 3. Parsing Architecture — THE CRITICAL CHANGE
 
+### What changed and why
+
+| | Old (Broken) | New (Correct) |
+|--|-------------|---------------|
+| Language | JavaScript | Python |
+| Library | pdf-parse + pdfjs-dist | **pdfplumber** |
+| Approach | Linear text scan — loses column position | Table grid extraction — reads column structure |
+| Bank-specific code | One parser per bank (CBA, NAB, etc.) | **One generic extractor for ALL banks** |
+| Column detection | Manual heuristics and guessing | Automatic — pdfplumber detects table columns |
+| Data leaves server | No | **No — runs on our own Railway instance** |
+| NAB result | 14 rows (broken) | ~70 rows (correct) |
+
+### Delete all old parser files
+When starting the Python rewrite session, **delete these files first:**
+- Any `*cba*parser*`, `*nab*parser*` JavaScript files in `lib/` or `api/`
+- Any `classifier.js` if it only routes to broken JS parsers
+- Do NOT keep broken code alongside new code
+
+### How pdfplumber works
+```python
+import pdfplumber
+
+with pdfplumber.open(pdf_path) as pdf:
+    for page in pdf.pages:
+        table = page.extract_table()
+        # Returns: [[date, particulars, debit, credit, balance], ...]
+        # Column positions are detected from the PDF's actual table structure
+        # No guessing — the table grid IS in the PDF
 ```
-C:\AWS\securestatement\
-├── CLAUDE.md                        <- This file
-├── index.html                       <- Vite entry point
-├── vite.config.js
-├── tailwind.config.js
-├── vercel.json
-├── package.json
-├── .env.example
-│
-├── src/                             <- React frontend
-│   ├── App.jsx                      <- Routes
-│   └── components/
-│
-├── api/                             <- Vercel serverless functions (JS)
-│
-├── lib/                             <- Shared JS utilities (parsers live here)
-├── middleware/
-├── utils/
-├── tools/
-│
-├── supabase/
-│   └── migrations/
-│
-└── test-pdfs/                       <- Synthetic PDFs only — no real statements
+
+---
+
+## 4. Python Parser Service — Full Specification
+
+### Deployment: Flask app on Railway
+- File: `parser/app.py`
+- Endpoint: `POST /parse` — accepts multipart PDF, returns JSON
+- Environment variable on Railway: `PARSER_SECRET` (shared with Vercel `/api/convert.js`)
+- Vercel `/api/convert.js` proxies user uploads to Railway `/parse`
+
+### Parser logic — step by step
+
+```python
+import pdfplumber
+import re
+from datetime import datetime
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+NOISE_ROWS = {
+    'brought forward', 'carried forward', 'transaction details',
+    'transaction details (continued)', 'date particulars debits credits balance',
+    'date', 'statement number', 'nab business everyday account',
+    'for further information', 'account details', 'identifying a transaction',
+    'summary of government charges', 'explanatory notes',
+    'please check all entries'
+}
+
+MONTH_MAP = {
+    'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+    'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12
+}
+
+def is_noise(text):
+    if not text:
+        return True
+    t = text.strip().lower()
+    if len(t) < 3:
+        return True
+    for noise in NOISE_ROWS:
+        if t.startswith(noise):
+            return True
+    # Internal reference codes
+    if re.match(r'^[\(:]?[A-Z0-9]{6,}', text.strip()):
+        return True
+    return False
+
+def parse_amount(val):
+    """Strip $, commas, Dr/Cr suffixes. Return float or None."""
+    if not val or not str(val).strip():
+        return None
+    v = re.sub(r'[\$,\s]', '', str(val))
+    v = re.sub(r'Dr$|Cr$', '', v, flags=re.IGNORECASE)
+    try:
+        return abs(float(v))
+    except:
+        return None
+
+def parse_date(val, year):
+    """Parse NAB date formats: '1 Jun 2022', '2 Jun 2022'. Return ISO string."""
+    if not val:
+        return None
+    val = val.strip()
+    # Format: "1 Jun 2022" or "1 Jun"
+    m = re.match(r'(\d{1,2})\s+([A-Za-z]{3})\s*(\d{4})?', val)
+    if m:
+        day = int(m.group(1))
+        mon = MONTH_MAP.get(m.group(2).lower())
+        yr = int(m.group(3)) if m.group(3) else year
+        if mon:
+            return f"{yr:04d}-{mon:02d}-{day:02d}"
+    return None
+
+def extract_statement_year(pdf):
+    """Get year from 'Statement starts D Month YYYY' in first page text."""
+    first_text = pdf.pages[0].extract_text() or ''
+    m = re.search(r'Statement starts.*?(\d{4})', first_text)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'\b(20\d{2})\b', first_text)
+    if m:
+        return int(m.group(1))
+    return datetime.now().year  # fallback only
+
+def extract_header_info(pdf):
+    """Extract account metadata from first page."""
+    text = pdf.pages[0].extract_text() or ''
+    info = {}
+    # Opening/closing balances
+    ob = re.search(r'Opening balance\s+\$?([\d,]+\.?\d*)', text)
+    cb = re.search(r'Closing balance\s+\$?([\d,]+\.?\d*)', text)
+    tc = re.search(r'Total credits\s+\$?([\d,]+\.?\d*)', text)
+    td = re.search(r'Total debits\s+\$?([\d,]+\.?\d*)', text)
+    info['openingBalance'] = parse_amount(ob.group(1)) if ob else None
+    info['closingBalance'] = parse_amount(cb.group(1)) if cb else None
+    info['totalCredits']   = parse_amount(tc.group(1)) if tc else None
+    info['totalDebits']    = parse_amount(td.group(1)) if td else None
+    # BSB and account number
+    bsb = re.search(r'BSB\s+(?:number\s+)?([\d-]+)', text)
+    acc = re.search(r'Account\s+number\s+([\d-]+)', text)
+    info['bsb'] = bsb.group(1) if bsb else ''
+    info['accountNumber'] = acc.group(1) if acc else ''
+    # Account holder
+    holder = re.search(r'((?:[A-Z][A-Z\s&]+){2,})\n', text)
+    info['accountName'] = holder.group(1).strip() if holder else ''
+    # Statement period
+    sf = re.search(r'Statement starts\s+(\d+\s+\w+\s+\d{4})', text)
+    st = re.search(r'Statement ends\s+(\d+\s+\w+\s+\d{4})', text)
+    info['periodFrom'] = sf.group(1) if sf else ''
+    info['periodTo']   = st.group(1) if st else ''
+    # Detect bank
+    if 'National Australia Bank' in text or 'NAB' in text:
+        info['bank'] = 'National Australia Bank'
+    elif 'Commonwealth Bank' in text or 'NetBank' in text:
+        info['bank'] = 'Commonwealth Bank'
+    elif 'Westpac' in text:
+        info['bank'] = 'Westpac'
+    elif 'Australia and New Zealand' in text or 'ANZ' in text:
+        info['bank'] = 'ANZ'
+    else:
+        info['bank'] = 'Unknown'
+    return info
+
+@app.route('/parse', methods=['POST'])
+def parse():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+
+    pdf_file = request.files['file']
+    transactions = []
+    header_info = {}
+    year = datetime.now().year
+
+    try:
+        with pdfplumber.open(pdf_file) as pdf:
+            year = extract_statement_year(pdf)
+            header_info = extract_header_info(pdf)
+            last_date = None
+
+            for page in pdf.pages:
+                table = page.extract_table()
+                if not table:
+                    continue
+
+                for row in table:
+                    if not row or all(c is None or str(c).strip() == '' for c in row):
+                        continue
+
+                    # Flatten: get text from each cell
+                    cells = [str(c).strip() if c else '' for c in row]
+
+                    # Skip noise rows
+                    row_text = ' '.join(cells).strip().lower()
+                    if is_noise(row_text):
+                        continue
+                    if is_noise(cells[0]) and is_noise(cells[1] if len(cells) > 1 else ''):
+                        continue
+
+                    # Expect: [date, description, debit, credit, balance]
+                    if len(cells) < 3:
+                        continue
+
+                    date_raw = cells[0]
+                    desc = cells[1] if len(cells) > 1 else ''
+                    debit_raw  = cells[2] if len(cells) > 2 else ''
+                    credit_raw = cells[3] if len(cells) > 3 else ''
+                    bal_raw    = cells[4] if len(cells) > 4 else ''
+
+                    # Parse date — inherit if blank
+                    parsed_date = parse_date(date_raw, year)
+                    if parsed_date:
+                        last_date = parsed_date
+                    elif not last_date:
+                        continue  # Can't place this row yet
+
+                    # Skip non-transaction description rows
+                    if not desc or is_noise(desc):
+                        continue
+
+                    debit  = parse_amount(debit_raw)
+                    credit = parse_amount(credit_raw)
+                    balance = parse_amount(bal_raw)
+
+                    # Must have at least an amount
+                    if debit is None and credit is None:
+                        continue
+
+                    transactions.append({
+                        'date': last_date,
+                        'description': desc,
+                        'debit': debit,
+                        'credit': credit,
+                        'balance': balance
+                    })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    # Validation checksums
+    sum_credits = sum(t['credit'] or 0 for t in transactions)
+    sum_debits  = sum(t['debit']  or 0 for t in transactions)
+    ob = header_info.get('openingBalance') or 0
+    cb = header_info.get('closingBalance') or 0
+    computed_close = round(ob + sum_debits - sum_credits, 2)
+    balance_valid = abs(computed_close - cb) < 0.05
+
+    return jsonify({
+        'bank': header_info.get('bank'),
+        'accountName': header_info.get('accountName'),
+        'accountNumber': header_info.get('accountNumber'),
+        'bsb': header_info.get('bsb'),
+        'statementPeriod': {
+            'from': header_info.get('periodFrom'),
+            'to': header_info.get('periodTo')
+        },
+        'openingBalance': header_info.get('openingBalance'),
+        'closingBalance': header_info.get('closingBalance'),
+        'validation': {
+            'sumCredits': round(sum_credits, 2),
+            'sumDebits': round(sum_debits, 2),
+            'balanceChecks': balance_valid,
+            'transactionCount': len(transactions)
+        },
+        'transactions': transactions
+    })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+```
+
+### Requirements file (`parser/requirements.txt`)
+```
+pdfplumber==0.11.0
+flask==3.0.3
+gunicorn==22.0.0
+```
+
+### Railway deployment (`parser/Procfile`)
+```
+web: gunicorn app:app
 ```
 
 ---
 
-## 3. Parser Status — Current State (as of April 2026)
-
-### CBA Parser — COMPLETE ✅
-All checks pass against synthetic test PDF:
-
-| Check | Result |
-|-------|--------|
-| `02/07/2025,Direct Credit 158824 CHALFONT CONSULT,,6600.00,6379.99` | PASS |
-| `02/07/2025,Direct Credit 143439 HAYSPERS,,6600.00,12979.99` | PASS |
-| `03/07/2025,Return THE GOOD GUYS FYSHWICK AU,,449.00,13428.99` | PASS |
-| `27/08/2025,Return GO RENTALS AUCKLAND NZ,,55.49,7894.19` | PASS |
-| `11/09/2025,Credit from xx7797,,5000.00,10161.24` | PASS |
-| Year on ALL rows = 2025 | PASS |
-
-**Do not touch the CBA parser unless a new bug is reported against a real statement.**
-
----
-
-### NAB Parser — COMPLETE ✅
-Validated against real 5-page statement: `7311-20220630-statement.pdf` (June 2022, AKSHAR PURSHOTTAM PTY LTD).
-
-**Full rewrite completed April 2026 using pdfjs-dist coordinate method.**
-
-| Check | Result |
-|-------|--------|
-| Row count: 110 transactions | PASS |
-| Sum credits = $25,568.19 | PASS |
-| Sum debits = $25,467.81 | PASS |
-| Balance equation: 12204.06 + 25467.81 - 25568.19 = 12103.68 | PASS |
-| All dates are year 2022 (not system year) | PASS |
-| No year prefix in descriptions | PASS |
-| Page 1 count = 9 transactions | PASS |
-| All 9 page 1 transactions correct (date, description, amount) | PASS |
-| Debit column populated (80 rows) | PASS |
-| Credit column populated (30 rows) | PASS |
-
-**Architecture:** coordinate-based (pdfjs-dist x/y positions), NOT text scan.
-- Column right-edges calibrated from header row: Debits≈394, Credits≈465, Balance≈549
-- Date inheritance: transactions without a date inherit the previous date
-- Multi-line descriptions: text-only continuation lines joined to the previous transaction
-- X-filter: items at x < 90 (margin reference codes like "044483", "/I") excluded
-- "Important" insurance block skipped; TRANSACTION SUMMARY block (30 Jun) skipped
-- Statement year extracted from "Statement starts 1 June 2022" (never uses system year)
-
-**Note on `keywordDirection` function:** kept in code for the fallback text parser only.
-Do NOT apply keyword overrides on the coordinate parser — x-position is authoritative.
-The spec's Section 4 keyword rule "Online B...Linked Acc Trns → Credit" is WRONG for
-at least one transaction in this statement (it's a debit by x-position and balance math).
-
-**Test script:** `tools/test-nab-parser.js` — run with the real PDF to verify.
-
----
-
-### Westpac Parser — NOT STARTED
-### ANZ Parser — NOT STARTED
-
-Build these next (Phase 1). Use the same parser interface as CBA and NAB (Section 5).
-
-### Bank Classifier — verify location
-Check `lib/` for an existing classifier that routes to the correct parser by bank. If it exists, extend it for Westpac and ANZ. If it doesn't exist, create `lib/classifier.js`.
-
----
-
-## 4. Parser Interface Contract (all parsers must match this)
+## 5. Vercel Proxy (`/api/convert.js`)
 
 ```javascript
-/**
- * @param {Buffer} pdfBuffer - Raw PDF file buffer
- * @returns {Promise<ParsedStatement>}
- */
-export async function parse(pdfBuffer) {
-  return {
-    bank: "Commonwealth Bank",        // string
-    accountName: "John Smith",        // string
-    accountNumber: "XXX-XXX 1234",   // always masked
-    bsb: "062-000",                  // always masked
-    statementPeriod: {
-      from: "2025-03-01",            // ISO date YYYY-MM-DD
-      to: "2025-03-31"
+// This file receives the PDF from the browser
+// and forwards it to the Railway Python parser
+// The PDF never goes anywhere except our own Railway instance
+
+import formidable from 'formidable';
+import fs from 'fs';
+import FormData from 'form-data';
+
+export const config = { api: { bodyParser: false } };
+
+const PARSER_URL = process.env.PARSER_URL; // e.g. https://secureparser.railway.app
+const PARSER_SECRET = process.env.PARSER_SECRET;
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') return res.status(405).end();
+
+  // Parse multipart upload
+  const form = formidable({ maxFileSize: 20 * 1024 * 1024 });
+  const [fields, files] = await form.parse(req);
+  const uploadedFile = files.file?.[0];
+  if (!uploadedFile) return res.status(400).json({ error: 'No file' });
+
+  // Check quota (anonymous = 3 pages, registered = 6/day, pro = unlimited)
+  // TODO: quota check against Supabase here
+
+  // Forward to our own Python parser on Railway
+  const formData = new FormData();
+  formData.append('file', fs.createReadStream(uploadedFile.filepath), {
+    filename: uploadedFile.originalFilename,
+    contentType: 'application/pdf'
+  });
+
+  const parseRes = await fetch(`${PARSER_URL}/parse`, {
+    method: 'POST',
+    headers: {
+      ...formData.getHeaders(),
+      'X-Secret': PARSER_SECRET
     },
-    openingBalance: 1250.00,          // number
-    closingBalance: 980.40,           // number
-    transactions: [
-      {
-        date: "2025-03-01",          // ISO date — never prepend year to description
-        description: "COLES 0456 SYDNEY",  // clean description only
-        debit: 45.60,                // number | null
-        credit: null,                // number | null
-        balance: 1204.40             // number
-      }
-    ]
-  };
+    body: formData
+  });
+
+  const result = await parseRes.json();
+
+  // Convert to CSV and return
+  // Or return raw JSON — let frontend handle format selection
+  return res.status(200).json(result);
 }
 ```
 
-### Parser Rules (learned from CBA/NAB fixes)
-- **Never prepend the year to description fields** — year belongs in `date` only
-- **Two-pass page handling** — always parse page 1 data even when subsequent pages have headers; do not skip page 1 transactions
-- **Balance-delta fallback** — when a row has no explicit debit/credit amount, derive amount from `current_balance - previous_balance`
-- **Validation:** `openingBalance + sum(credits) - sum(debits) = closingBalance` (tolerance ±$0.01)
-- **No null `date` or `description`** fields allowed in output
-
 ---
 
-## 5. Standard CSV Output Schema
+## 6. Environment Variables
 
-```
-date,description,debit,credit,balance,reference,accountName,accountNumber,bsb,bankName,currency
-2025-03-01,COLES 0456 SYDNEY,45.60,,1204.40,,John Smith,XXX-XXX 1234,062-000,Commonwealth Bank,AUD
-```
+```bash
+# Vercel env vars
+PARSER_URL=https://your-parser.railway.app   # Your Railway Python service
+PARSER_SECRET=random-shared-secret           # Shared secret between Vercel and Railway
 
----
+SUPABASE_URL=
+SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_KEY=
 
-## 6. Plans & Pricing
+STRIPE_SECRET_KEY=
+STRIPE_PRICE_PRO=
+STRIPE_PRICE_ACCOUNTANT=
+STRIPE_WEBHOOK_SECRET=
+VITE_STRIPE_PUBLISHABLE_KEY=
 
-| Plan | Price | Limits & Features |
-|------|-------|------------------|
-| **Free – Anonymous** | $0 | 3 pages per session, no login, no history, CSV export |
-| **Free – Registered** | $0 | 6 pages/24hrs, single upload, CSV export, last 10 files |
-| **Pro** | $19/month | Unlimited pages (fair-use), bulk upload, CSV + XLSX, full history, faster queue |
-| **Accountant** | $49/month | Pro + client folders, 5 team members, API access, webhooks |
-| **Enterprise** | **No price shown** | -> "Book a Call" CTA only -> AI Agent Service proposal |
-
-**Enterprise must never display a dollar amount.**
-
----
-
-## 7. Supported Banks
-
-### Tier 1 — MVP
-- **CBA** ✅ Complete
-- **NAB** ✅ Complete — validated against real 5-page PDF (June 2022)
-- **Westpac** — TODO
-- **ANZ** — TODO
-
-### Tier 2 — Phase 2 only (do not start until instructed)
-Macquarie, Bankwest, Suncorp, Bendigo, BOQ, ING
-
-### Tier 3 — Phase 3 only
-AMP, ME Bank, HSBC, Judo
-
----
-
-## 8. Parsing Pipeline (Per Upload)
-
-```
-1. User uploads PDF (anonymous or authenticated)
-2. Quota check -> reject with upgrade CTA if exceeded
-3. Store PDF temporarily (Supabase Storage)
-4. Bank classifier detects bank + statement type
-5. Route to bank-specific parser
-6. Normalise to standard schema
-7. Validate (balance reconciliation, date sanity)
-8. Store parsed transactions in Supabase
-9. Return CSV / XLSX / JSON to user
-10. PDF auto-deleted after 7 days
+MAILERLITE_API_KEY=
+MAILERLITE_GROUP_ID=
 ```
 
 ---
 
-## 9. API Endpoints (`/api/*.js`)
+## 7. Plans & Pricing
 
-| Endpoint | Method | Auth | Purpose |
-|----------|--------|------|---------|
-| `/api/convert` | POST | Optional | Upload PDF, parse, return download |
-| `/api/auth/signup` | POST | None | Register (Supabase) |
-| `/api/auth/login` | POST | None | Login (Supabase) |
-| `/api/user/quota` | GET | Required | Pages used / remaining |
-| `/api/user/history` | GET | Required | Conversion history |
-| `/api/billing/subscribe` | POST | Required | Stripe subscription |
-| `/api/billing/portal` | POST | Required | Stripe billing portal |
-| `/api/mailerlite-signup` | POST | None | Waitlist / email capture |
+| Plan | Price | Limits |
+|------|-------|--------|
+| **Free – Anonymous** | $0 | 3 pages per session, no login, CSV only |
+| **Free – Registered** | $0 | 6 pages/24hrs, CSV only, last 10 files |
+| **Pro** | $19/month | Unlimited pages, CSV + XLSX, full history |
+| **Accountant** | $49/month | Pro + client folders, 5 team members, API, webhooks |
+| **Enterprise** | **No price** | Book a Call → AI Agent Service |
+
+**Enterprise must never show a price.**
 
 ---
 
-## 10. Quota Enforcement
+## 8. Supported Banks
 
-| User | Quota |
-|------|-------|
-| Anonymous | 3 pages per session (IP + cookie) |
-| Free registered | 6 pages per 24-hour rolling window |
-| Pro | Unlimited, flag abuse >500 pages/day |
-| Accountant | Same as Pro, shared pool across team |
-| Enterprise | Manual — no automated quota |
+**pdfplumber reads the table structure — bank-specific parsers are no longer needed.**
+The same `extract_table()` call works for CBA, NAB, Westpac, ANZ and any other bank.
 
-On breach: friendly error + upgrade CTA. Never a raw error.
+Post-processing differences per bank (handle in `extract_header_info`):
+- CBA: "Commonwealth Bank" in text, BSB format `0xx-xxx`
+- NAB: "National Australia Bank", may have "Dr" suffix on balances (overdraft)
+- Westpac: "Westpac" in text
+- ANZ: "Australia and New Zealand Banking" in text
+
+**Tier 1 (MVP):** CBA, NAB, Westpac, ANZ
+**Tier 2 (Phase 2):** Macquarie, Bankwest, Suncorp, Bendigo, BOQ, ING — do not start until instructed
+
+---
+
+## 9. Validation Checksums (NAB Test Statement)
+
+After parsing `7311-20220630-statement.pdf`:
+```
+sumCredits  = 25568.19  (±0.02)
+sumDebits   = 25467.81  (±0.02)
+openingBal  = 12204.06
+closingBal  = 12103.68
+rowCount    ≈ 70+
+page1Rows   = 9 (all dated 2022-06-01)
+year        = 2022  (never 2026)
+```
+
+---
+
+## 10. Standard Output Schema
+
+```json
+{
+  "date": "2022-06-01",
+  "description": "Springbank Rise 166111",
+  "debit": null,
+  "credit": 590.00,
+  "balance": null
+}
+```
+
+CSV columns: `date, description, debit, credit, balance, bankName, accountNumber, bsb`
 
 ---
 
 ## 11. Supabase Schema
 
 ```sql
-profiles (id, email, plan, pages_used_today, quota_reset_at, created_at)
-conversions (id, user_id, filename, bank_detected, page_count, status, created_at, expires_at)
-transactions (id, conversion_id, date, description, debit, credit, balance, bank_name)
+profiles      (id, email, plan, pages_used_today, quota_reset_at, created_at)
+conversions   (id, user_id, filename, bank_detected, page_count, status, created_at, expires_at)
+transactions  (id, conversion_id, date, description, debit, credit, balance, bank_name)
 subscriptions (id, user_id, stripe_customer_id, stripe_subscription_id, plan, status, current_period_end)
 ```
-
-RLS must be enabled on all tables.
+RLS enabled on all tables.
 
 ---
 
-## 12. Security & Privacy
+## 12. Phase 1 Remaining Build Tasks
 
-- HTTPS everywhere (Vercel-enforced)
-- PDFs auto-deleted after 7 days
-- Users can manually delete files at any time
-- Server-side access control only — users see only their own files
+- [ ] **Deploy Python parser to Railway** — `parser/app.py`, test against NAB real PDF
+- [ ] **Wire `/api/convert.js`** — proxy to Railway, return JSON to frontend
+- [ ] **Upload UI** — drag-drop PDF → loading → row count → Download CSV button
+- [ ] **Quota enforcement** — anonymous 3 pages, free 6/day, pro unlimited
+- [ ] **Supabase auth** — signup/login endpoints
+- [ ] **Stripe plans** — Pro + Accountant checkout, webhook handler
+- [ ] **Pricing page** — 4 plan cards + Enterprise "Book a Call" (no price)
+- [ ] **Dashboard** — conversion history from Supabase
+
+---
+
+## 13. Security & Privacy
+
+- PDFs auto-deleted after 7 days (Supabase Storage lifecycle)
+- Railway Python service is internal — not publicly documented
+- `PARSER_SECRET` header validates all requests from Vercel to Railway
 - No PII or transaction content in logs
-- Stripe handles all card data — never store payment details
+- RLS on all Supabase tables
+- Stripe handles all card data
 
 ---
 
-## 13. Landing Page Copy (AU-Optimised — use exactly this)
+## 14. Landing Page Copy (AU-Optimised)
 
 **Headline:** Convert Australian bank statements to CSV in seconds
 **Subheadline:** Upload your CBA, NAB, Westpac, ANZ and other Australian bank PDFs and instantly download clean CSV files ready for Xero, Excel, or your accountant.
@@ -293,99 +513,41 @@ RLS must be enabled on all tables.
 **Secondary CTA:** [See Pricing]
 
 **3 benefit tiles:**
-1. Built for Australian banks — Optimised parsers for CBA, NAB, Westpac, ANZ and more
-2. Perfect for accountants & brokers — Structured data for reconciliation, loan assessment, and compliance
-3. Fast, secure, and simple — Drag, drop, convert. Encrypted in transit and at rest.
-
-**How It Works:**
-1. Upload your PDF bank statement
-2. We detect the bank and parse the transactions
-3. Download CSV/XLSX or send it to your accountant
-
-**FAQ:**
-- Which banks? CBA, NAB, Westpac, ANZ — more added regularly.
-- Is my data secure? Encrypted in transit and at rest. Delete files any time.
-- Do I need an account? No. Try anonymously. Register free for more features.
-- What formats? CSV (all plans), XLSX (Pro+), JSON (Accountant/API).
+1. Built for Australian banks — CBA, NAB, Westpac, ANZ and more
+2. Perfect for accountants & brokers — reconciliation, loan assessment, compliance
+3. Fast, secure, and private — your data never leaves Australian servers
 
 ---
 
-## 14. Enterprise Section — AI Agent Service
+## 15. Enterprise → Track 1 Handoff
 
-### Pricing Page Copy
 ```
-Enterprise — Let's Talk
-
-Need more than a converter?
-We build custom AI agents that automate your entire back-office workflow —
+Enterprise tile copy:
+"Need more than a converter?
+We build custom AI agents that automate your entire back-office —
 invoicing, lead follow-up, client onboarding, report generation.
-
 Built in 2 weeks. Done-for-you. No tech team required.
-
-[Book a Free Discovery Call]
+[Book a Free Discovery Call]"
 ```
-
-### Book a Call
-- Calendly embed OR contact form (name + email + company + message)
-- On submit: notify Gaurav via email
-- No complex CRM — simple for MVP
-
-### What the Call Leads To
-- Setup fee: $3,000–$5,000 (10-day delivery)
-- Retainer: $500–$1,000/month
-- Use cases: Invoicing, Lead Follow-Up, Report Generation, Onboarding
-- Stack: Claude + n8n + Gmail API + Airtable + Xero/Stripe
+On click: mailto:gaurav.bodar@gmail.com or Calendly embed.
 
 ---
 
-## 15. Roadmap
+## 16. Claude Code Working Rules
 
-### Phase 1 — Current Sprint
-- [x] CBA parser — COMPLETE
-- [x] NAB parser — COMPLETE, validated against real PDF
-- [ ] Westpac parser
-- [ ] ANZ parser
-- [ ] Landing page (copy from Section 13)
-- [ ] Anonymous upload + convert flow
-- [ ] Registered auth (Supabase)
-- [ ] CSV export
-- [ ] Stripe subscriptions
-- [ ] Dashboard + file history
-- [ ] Quota enforcement
-- [ ] Enterprise "Book a Call" section
-
-### Phase 2
-- [ ] Bulk upload, client folders, XLSX export, email delivery, Tier 2 banks
-
-### Phase 3
-- [ ] API + webhooks, categorisation, Tier 3 banks
+1. **pdfplumber only** — no pdf-parse, no pdfjs-dist, no external parsing APIs
+2. **Data sovereignty** — PDFs never routed to third-party services. Ever.
+3. **Delete all old JS parsers** before starting Python rewrite
+4. **One generic extractor** — no bank-specific parser files
+5. **Railway for Python** — Vercel runs JS only; parser runs on Railway
+6. **Enterprise = no price** — "Book a Call" only
+7. **Stripe only** for payments, **Supabase only** for data
+8. **No real bank PDFs in repo** — synthetic test data only
+9. **RLS on** all Supabase tables
+10. **Tier 2+ banks** — do not start without explicit instruction
 
 ---
 
-## 16. Synthetic Test Data Rules
-
-**Never commit real bank statements.**
-
-Synthetic PDFs in `test-pdfs/` must:
-- Balance reconcile: `opening + credits - debits = closing` (±$0.01)
-- Use fake realistic descriptions: "COLES 0456 SYDNEY", "RENT PAYMENT", "PAYROLL ABC PTY LTD"
-- Include short (5–10 txns) and long (50–100 txns) variants per bank
-- Cover debits, credits, fees, interest, refunds
-
----
-
-## 17. Working Rules for Claude Code
-
-1. **CBA parser is complete — do not touch it** unless a new bug is reported against a real statement.
-2. **NAB parser is code-complete** — verify the 2 pending checks against the real 5-page PDF before marking done.
-3. **Parser rules** — never prepend year to descriptions, always two-pass pages, always use balance-delta fallback (Section 4).
-4. **JavaScript only** — `pdf-parse` / `pdfjs-dist`. No Python.
-5. **All parsers match the interface in Section 4** — same return shape.
-6. **Check for existing files before creating** — classifier, Supabase client, Stripe helpers may already exist in `lib/`.
-7. **Enterprise = Book a Call only** — never show a price.
-8. **Supabase for all data, Stripe for all payments** — no alternatives.
-9. **Vercel serverless only** — no separate Express server.
-10. **RLS enabled** on all Supabase tables.
-11. **No real bank PDFs in repo** — synthetic test data only.
-12. **Do not start Tier 2+ banks** without explicit instruction.
-
+*SecureStatementConverter — Gaurav Bodar | April 2026 | CONFIDENTIAL*
+*Architecture: React+Vite (Vercel) + Python/pdfplumber (Railway) + Supabase + Stripe*
+*Data sovereignty: All processing on own infrastructure — no third-party PDF APIs*

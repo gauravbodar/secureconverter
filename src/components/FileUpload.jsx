@@ -131,34 +131,26 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
         throw new Error(`Upload failed with status: ${response.status}`);
       }
 
-      const contentType = response.headers.get('content-type');
+      const data = await response.json();
 
-      if (contentType && contentType.includes('application/json')) {
-        const data = await response.json();
-        toast({
-          title: "Success! ✅",
-          description: data.message || "Your file has been processed successfully.",
+      if (data.error) {
+        throw new Error(data.error);
+      }
+
+      if (onConversionComplete) {
+        onConversionComplete({
+          transactions: data.transactions,
+          bank: data.bank,
+          accountName: data.accountName,
+          accountNumber: data.accountNumber,
+          bsb: data.bsb,
+          statementPeriod: data.statementPeriod,
+          openingBalance: data.openingBalance,
+          closingBalance: data.closingBalance,
+          validation: data.validation,
+          originalFilename: file.name,
+          pageCount,
         });
-      } else {
-        const blob = await response.blob();
-        const contentDisposition = response.headers.get('content-disposition');
-        let filename = 'statement.csv';
-        if (contentDisposition) {
-          const filenameMatch = contentDisposition.match(/filename="?([^"]+)"?/);
-          if (filenameMatch && filenameMatch.length === 2) {
-            filename = filenameMatch[1];
-          }
-        }
-
-        // Navigate to results page
-        if (onConversionComplete) {
-          onConversionComplete({
-            blob,
-            filename,
-            originalFilename: file.name,
-            pageCount
-          });
-        }
       }
 
       setFile(null);

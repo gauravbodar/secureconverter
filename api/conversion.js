@@ -2,19 +2,24 @@
  * /api/conversion — Consolidated conversion handler
  *
  * Routes handled:
- *   POST /api/conversion/convert   (multipart PDF → CSV)
+ *   POST /api/conversion/convert   (multipart PDF → JSON via Railway Python parser)
  *
  * bodyParser is disabled so formidable can handle multipart uploads.
+ * PDFs are proxied to our own Railway Python service — never sent to third parties.
  */
 
 import formidable from 'formidable';
-import { readFile, unlink } from 'fs/promises';
+import { unlink } from 'fs/promises';
+import { createReadStream } from 'fs';
+import FormData from 'form-data';
 import { setCors } from '../middleware/corsHeaders.js';
 import { optionalAuth } from '../middleware/auth.js';
 import { conversionLimiter } from '../middleware/rateLimit.js';
-import { parsePDFToCSV } from '../lib/pdf-parser.js';
 import { supabase } from '../lib/supabase.js';
 import { Errors } from '../utils/response.js';
+
+const PARSER_URL    = process.env.PARSER_URL;
+const PARSER_SECRET = process.env.PARSER_SECRET;
 
 export const config = { api: { bodyParser: false } };
 
@@ -97,20 +102,42 @@ async function handleConvert(req, res) {
     }
   }
 
-  let buffer;
-  try {
-    buffer = await readFile(uploadedFile.filepath);
-  } finally {
+  if (!PARSER_URL) {
     unlink(uploadedFile.filepath).catch(() => {});
+    console.error('[conversion/convert] PARSER_URL not configured');
+    return Errors.INTERNAL(res, 'Parser service not configured.');
   }
 
   const startMs = Date.now();
   let parsed;
   try {
-    parsed = await parsePDFToCSV(buffer);
+    const formData = new FormData();
+    formData.append('file', createReadStream(uploadedFile.filepath), {
+      filename: uploadedFile.originalFilename || 'statement.pdf',
+      contentType: 'application/pdf',
+    });
+
+    const parseRes = await fetch(`${PARSER_URL}/parse`, {
+      method: 'POST',
+      headers: {
+        ...formData.getHeaders(),
+        'X-Secret': PARSER_SECRET || '',
+      },
+      body: formData,
+    });
+
+    if (!parseRes.ok) {
+      const errBody = await parseRes.text();
+      console.error('[conversion/convert] Railway error:', parseRes.status, errBody);
+      return Errors.CONVERSION_FAILED(res);
+    }
+
+    parsed = await parseRes.json();
   } catch (err) {
-    console.error('[conversion/convert] parse error:', err.message);
+    console.error('[conversion/convert] proxy error:', err.message);
     return Errors.CONVERSION_FAILED(res);
+  } finally {
+    unlink(uploadedFile.filepath).catch(() => {});
   }
 
   const conversionTimeMs = Date.now() - startMs;
@@ -129,14 +156,7 @@ async function handleConvert(req, res) {
     supabase.rpc('increment_conversion_count', { uid: user.userId }).then(() => {}).catch(() => {});
   }
 
-  const originalName = (uploadedFile.originalFilename || 'statement').replace(/\.pdf$/i, '');
-  const csvFilename  = `${originalName}_converted.csv`;
-
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="${csvFilename}"`);
-  res.setHeader('X-Bank-Type', parsed.bank);
-  res.setHeader('X-Row-Count', String(parsed.rowCount));
-  res.status(200).end(parsed.csv);
+  return res.status(200).json(parsed);
 }
 
 // ── main handler ──────────────────────────────────────────────────────────────
