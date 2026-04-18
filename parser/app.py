@@ -112,9 +112,88 @@ def extract_header_info(pdf):
         info['bank'] = 'Unknown'
     return info
 
+def extract_rows_by_position(page):
+    """
+    Extract transaction rows using word x/y positions.
+    Used instead of extract_table() because NAB PDFs have no ruled borders.
+    Groups words by y-coordinate into lines, then splits each line
+    into 5 columns by x-coordinate thresholds.
+    """
+    words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
+    if not words:
+        return []
+
+    # Group words into lines by y-position (snap to 3pt grid)
+    lines = {}
+    for word in words:
+        y = round(float(word['top']) / 3) * 3
+        if y not in lines:
+            lines[y] = []
+        lines[y].append(word)
+
+    # NAB column x-boundaries (points from left edge of page)
+    # Date column:        x < 80
+    # Particulars column: 80 <= x < 350
+    # Debits column:      350 <= x < 430
+    # Credits column:     430 <= x < 510
+    # Balance column:     x >= 510
+    DATE_MAX = 80
+    PART_MAX = 350
+    DEBT_MAX = 430
+    CRED_MAX = 510
+
+    rows = []
+    for y in sorted(lines.keys()):
+        line_words = sorted(lines[y], key=lambda w: float(w['x0']))
+        date_p, part_p, deb_p, cred_p, bal_p = [], [], [], [], []
+
+        for w in line_words:
+            x = float(w['x0'])
+            if x < DATE_MAX:
+                date_p.append(w['text'])
+            elif x < PART_MAX:
+                part_p.append(w['text'])
+            elif x < DEBT_MAX:
+                deb_p.append(w['text'])
+            elif x < CRED_MAX:
+                cred_p.append(w['text'])
+            else:
+                bal_p.append(w['text'])
+
+        rows.append([
+            ' '.join(date_p),
+            ' '.join(part_p),
+            ' '.join(deb_p),
+            ' '.join(cred_p),
+            ' '.join(bal_p),
+        ])
+
+    return rows
+
+
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'}), 200
+
+@app.route('/debug', methods=['POST'])
+def debug():
+    """Returns word positions from page 1 — used to calibrate column boundaries."""
+    secret = request.headers.get('X-Secret', '')
+    if secret != os.environ.get('PARSER_SECRET', ''):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    pdf_file = request.files.get('file')
+    if not pdf_file:
+        return jsonify({'error': 'No file'}), 400
+
+    with pdfplumber.open(pdf_file) as pdf:
+        page = pdf.pages[0]
+        words = page.extract_words(x_tolerance=3, y_tolerance=3)
+        return jsonify([
+            {'text': w['text'], 'x0': round(float(w['x0'])), 'top': round(float(w['top']))}
+            for w in words[:80]
+        ])
+
 
 @app.route('/parse', methods=['POST'])
 def parse():
@@ -137,7 +216,8 @@ def parse():
             last_date = None
 
             for page in pdf.pages:
-                table = page.extract_table()
+                # Use position-based extraction — NAB has no ruled table borders
+                table = extract_rows_by_position(page)
                 if not table:
                     continue
 
