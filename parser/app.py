@@ -137,10 +137,10 @@ def extract_rows_by_position(page):
     # Debits column:      350 <= x < 430
     # Credits column:     430 <= x < 510
     # Balance column:     x >= 510
-    DATE_MAX = 80
-    PART_MAX = 350
-    DEBT_MAX = 430
-    CRED_MAX = 510
+    DATE_MAX = 75
+    PART_MAX = 345
+    DEBT_MAX = 425
+    CRED_MAX = 505
 
     rows = []
     for y in sorted(lines.keys()):
@@ -187,11 +187,12 @@ def debug():
         return jsonify({'error': 'No file'}), 400
 
     with pdfplumber.open(pdf_file) as pdf:
-        page = pdf.pages[0]
+        # Use page 2 — it starts immediately with transaction rows, no header noise
+        page = pdf.pages[1]
         words = page.extract_words(x_tolerance=3, y_tolerance=3)
         return jsonify([
             {'text': w['text'], 'x0': round(float(w['x0'])), 'top': round(float(w['top']))}
-            for w in words[:80]
+            for w in words[:100]
         ])
 
 
