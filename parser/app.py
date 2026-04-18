@@ -137,10 +137,10 @@ def extract_rows_by_position(page):
     # Debits column:      350 <= x < 430
     # Credits column:     430 <= x < 510
     # Balance column:     x >= 510
-    DATE_MAX = 75
-    PART_MAX = 345
-    DEBT_MAX = 425
-    CRED_MAX = 505
+    DATE_MAX = 100    # Date words end at x=76
+    PART_MAX = 365    # Particulars end ~x=285, debits start at x=371
+    DEBT_MAX = 430    # Debits end ~x=380, credits start at x=435
+    CRED_MAX = 498    # Credits end ~x=442, balance starts at x=501
 
     rows = []
     for y in sorted(lines.keys()):
