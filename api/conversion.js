@@ -1,196 +1,115 @@
-/**
- * /api/conversion — Consolidated conversion handler
- *
- * Routes handled:
- *   POST /api/conversion/convert   (multipart PDF → JSON via Railway Python parser)
- *
- * bodyParser is disabled so formidable can handle multipart uploads.
- * PDFs are proxied to our own Railway Python service — never sent to third parties.
- */
-
 import formidable from 'formidable';
 import fs from 'fs';
-import { setCors } from '../middleware/corsHeaders.js';
-import { optionalAuth } from '../middleware/auth.js';
-import { conversionLimiter } from '../middleware/rateLimit.js';
-import { supabase } from '../lib/supabase.js';
-import { Errors } from '../utils/response.js';
-
-const PARSER_URL    = process.env.PARSER_URL;
-const PARSER_SECRET = process.env.PARSER_SECRET;
 
 export const config = { api: { bodyParser: false } };
 
-const FREE_DAILY_LIMIT = 3;
-
-function getClientIP(req) {
-  return (
-    req.headers['x-forwarded-for']?.split(',')[0].trim() ||
-    req.headers['x-real-ip'] ||
-    req.socket?.remoteAddress ||
-    'unknown'
-  );
-}
-
-async function checkAndIncrementQuota(userId, ip) {
-  const today = new Date().toISOString().slice(0, 10);
-  const key   = userId || ip;
-
-  const { data: quota } = await supabase
-    .from('daily_limits')
-    .select('*')
-    .eq('key', key)
-    .eq('date', today)
-    .single();
-
-  if (!quota) {
-    await supabase.from('daily_limits').insert({ key, date: today, count: 1 });
-    return { allowed: true, count: 1 };
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  if (quota.count >= FREE_DAILY_LIMIT && !userId) {
-    return { allowed: false, count: quota.count };
-  }
+  // Step 1 — Parse incoming upload with formidable
+  const form = formidable({
+    maxFileSize: 20 * 1024 * 1024,
+    keepExtensions: true
+  });
 
-  await supabase
-    .from('daily_limits')
-    .update({ count: quota.count + 1 })
-    .eq('id', quota.id);
-
-  return { allowed: true, count: quota.count + 1 };
-}
-
-async function handleConvert(req, res) {
-  // Optional auth
-  let user = null;
-  await new Promise((resolve) => optionalAuth(req, res, () => { user = req.user; resolve(); }));
-
-  // Rate limit
-  await new Promise((resolve) => conversionLimiter(req, res, resolve));
-  if (res.headersSent) return;
-
-  // Parse multipart
-  const form = formidable({ maxFileSize: 10 * 1024 * 1024, keepExtensions: true });
-  let files;
+  let fields, files;
   try {
-    [, files] = await form.parse(req);
-  } catch (err) {
-    if (err.code === 1016) return Errors.FILE_TOO_LARGE(res);
-    console.error('[conversion/convert] parse error:', err);
-    return Errors.INTERNAL(res, 'Failed to read uploaded file.');
+    [fields, files] = await form.parse(req);
+  } catch (e) {
+    return res.status(400).json({
+      success: false,
+      error: 'Could not read uploaded file: ' + e.message
+    });
   }
 
-  const uploadedFile = Array.isArray(files.file) ? files.file[0] : files.file;
+  // Step 2 — Get the uploaded file
+  const uploadedFile = files.file?.[0] || files.pdf?.[0];
   if (!uploadedFile) {
-    return res.status(400).json({ success: false, error: 'No file uploaded.', code: 'NO_FILE' });
+    return res.status(400).json({
+      success: false,
+      error: 'No file found in upload. Field name must be "file".'
+    });
   }
 
-  if (uploadedFile.mimetype !== 'application/pdf') {
-    await fs.promises.unlink(uploadedFile.filepath).catch(() => {});
-    return Errors.INVALID_FILE_TYPE(res);
+  // Step 3 — Read file into Buffer (not a stream)
+  let fileBuffer;
+  try {
+    fileBuffer = fs.readFileSync(uploadedFile.filepath);
+  } catch (e) {
+    return res.status(500).json({
+      success: false,
+      error: 'Could not read temp file: ' + e.message
+    });
   }
 
-  const ip = getClientIP(req);
+  // Step 4 — Build multipart body manually using Buffer
+  // This is the most reliable way in serverless — no stream, no form-data package
+  const boundary = '----VercelParserBoundary' + Date.now();
+  const filename = uploadedFile.originalFilename || 'statement.pdf';
 
-  if (!user) {
-    const quota = await checkAndIncrementQuota(null, ip);
-    if (!quota.allowed) {
-      await fs.promises.unlink(uploadedFile.filepath).catch(() => {});
-      return Errors.DAILY_LIMIT_REACHED(res);
-    }
-  }
+  const beforeFile = Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
+    `Content-Type: application/pdf\r\n\r\n`
+  );
+  const afterFile = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const body = Buffer.concat([beforeFile, fileBuffer, afterFile]);
+
+  // Step 5 — Forward to Railway Python parser
+  const PARSER_URL = process.env.PARSER_URL;
+  const PARSER_SECRET = process.env.PARSER_SECRET;
 
   if (!PARSER_URL) {
-    fs.promises.unlink(uploadedFile.filepath).catch(() => {});
-    console.error('[conversion/convert] PARSER_URL not configured');
-    return Errors.INTERNAL(res, 'Parser service not configured.');
+    return res.status(500).json({
+      success: false,
+      error: 'PARSER_URL environment variable not set on Vercel'
+    });
   }
 
-  const startMs = Date.now();
+  let parserRes;
+  try {
+    parserRes = await fetch(`${PARSER_URL}/parse`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': body.length.toString(),
+        'X-Secret': PARSER_SECRET || ''
+      },
+      body: body
+    });
+  } catch (e) {
+    return res.status(502).json({
+      success: false,
+      error: 'Could not reach parser service: ' + e.message
+    });
+  }
 
-  // Build FormData using npm 'form-data' — NOT browser FormData — so getHeaders() works
-  const FormData = (await import('form-data')).default;
-  const parserForm = new FormData();
-  parserForm.append('file', fs.createReadStream(uploadedFile.filepath), {
-    filename: uploadedFile.originalFilename || 'statement.pdf',
-    contentType: uploadedFile.mimetype || 'application/pdf',
-    knownLength: uploadedFile.size,
-  });
+  // Step 6 — Clean up temp file
+  try { fs.unlinkSync(uploadedFile.filepath); } catch {}
+
+  // Step 7 — Return parser response
+  const rawText = await parserRes.text();
+  console.log('Railway status:', parserRes.status);
+  console.log('Railway response preview:', rawText.substring(0, 300));
 
   let result;
   try {
-    const parserResponse = await fetch(`${PARSER_URL}/parse`, {
-      method: 'POST',
-      headers: {
-        ...parserForm.getHeaders(),
-        'X-Secret': PARSER_SECRET || '',
-      },
-      body: parserForm,
+    result = JSON.parse(rawText);
+  } catch (e) {
+    return res.status(502).json({
+      success: false,
+      error: 'Parser returned invalid response: ' + rawText.substring(0, 200)
     });
-
-    const rawText = await parserResponse.text();
-    console.log('Railway status:', parserResponse.status);
-    console.log('Railway raw response:', rawText.substring(0, 500));
-
-    try {
-      result = JSON.parse(rawText);
-    } catch (e) {
-      return res.status(502).json({
-        success: false,
-        error: 'Parser returned invalid JSON: ' + rawText.substring(0, 300),
-        code: 'PARSER_INVALID_JSON',
-      });
-    }
-
-    if (!parserResponse.ok) {
-      return res.status(502).json({
-        success: false,
-        error: result.error || 'Parser failed',
-        code: 'PARSER_ERROR',
-      });
-    }
-  } catch (err) {
-    console.error('[conversion/convert] proxy error:', err.message);
-    return Errors.CONVERSION_FAILED(res);
-  } finally {
-    try { fs.unlinkSync(uploadedFile.filepath); } catch {}
   }
 
-  const conversionTimeMs = Date.now() - startMs;
-
-  // Log (best-effort)
-  supabase.from('conversions').insert({
-    user_id:            user?.userId || null,
-    filename:           uploadedFile.originalFilename || 'statement.pdf',
-    file_size:          uploadedFile.size,
-    bank_type:          result.bank,
-    conversion_time_ms: conversionTimeMs,
-    status:             'success',
-  }).then(() => {}).catch(() => {});
-
-  if (user?.userId) {
-    supabase.rpc('increment_conversion_count', { uid: user.userId }).then(() => {}).catch(() => {});
+  if (!parserRes.ok) {
+    return res.status(502).json({
+      success: false,
+      error: result.error || 'Parser failed with status ' + parserRes.status
+    });
   }
 
   return res.status(200).json({ success: true, ...result });
-}
-
-// ── main handler ──────────────────────────────────────────────────────────────
-
-export default async function handler(req, res) {
-  if (setCors(req, res)) return;
-
-  const path = new URL(req.url, 'http://localhost').pathname;
-
-  try {
-    if (req.method === 'POST' && path.endsWith('/convert')) {
-      return await handleConvert(req, res);
-    }
-
-    return Errors.METHOD_NOT_ALLOWED(res);
-
-  } catch (err) {
-    console.error('[api/conversion]', err);
-    return Errors.INTERNAL(res);
-  }
 }
