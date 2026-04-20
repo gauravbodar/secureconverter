@@ -10,7 +10,6 @@
  */
 
 import { setCors } from '../middleware/corsHeaders.js';
-import { requireAuth } from '../middleware/auth.js';
 import { stripe, PLANS } from '../lib/stripe.js';
 import { supabase } from '../lib/supabase.js';
 import { success, Errors } from '../utils/response.js';
@@ -33,8 +32,14 @@ function getRawBody(req) {
 // ── /create-checkout ──────────────────────────────────────────────────────────
 
 async function handleCreateCheckout(req, res, rawBody) {
-  await new Promise((resolve) => requireAuth(req, res, resolve));
-  if (res.headersSent) return;
+  // Authenticate via Supabase Auth token
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return Errors.UNAUTHORIZED(res);
+
+  const token = authHeader.slice(7).trim();
+  const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+  if (authError || !user) return Errors.UNAUTHORIZED(res);
+  req.user = { userId: user.id, email: user.email };
 
   let body;
   try {
@@ -43,30 +48,36 @@ async function handleCreateCheckout(req, res, rawBody) {
     return res.status(400).json({ success: false, error: 'Invalid JSON body.', code: 'BAD_REQUEST' });
   }
 
-  const { planId } = body;
-  const plan = PLANS[planId];
+  // plan = 'pro' | 'accountant'
+  const { plan: planKey } = body;
+  const plan = PLANS[planKey];
 
   if (!plan || !plan.priceId) {
-    return res.status(400).json({ success: false, error: 'Invalid or unconfigured plan.', code: 'INVALID_PLAN' });
+    return res.status(400).json({
+      success: false,
+      error: `Invalid or unconfigured plan "${planKey}". Valid options: pro, accountant.`,
+      code: 'INVALID_PLAN',
+    });
   }
 
-  const { data: user } = await supabase
-    .from('users')
-    .select('email, stripe_customer_id')
+  // Look up email from Supabase Auth (profiles table)
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('email')
     .eq('id', req.user.userId)
     .single();
 
-  if (!user) return Errors.UNAUTHORIZED(res);
+  const email = profile?.email || req.user.email;
+  if (!email) return Errors.UNAUTHORIZED(res);
 
   const session = await stripe.checkout.sessions.create({
-    mode:                  'subscription',
-    payment_method_types:  ['card'],
-    customer_email:        user.stripe_customer_id ? undefined : user.email,
-    customer:              user.stripe_customer_id || undefined,
-    line_items:            [{ price: plan.priceId, quantity: 1 }],
-    metadata:              { userId: req.user.userId, planId },
-    success_url:           `${APP_URL}/dashboard?payment=success`,
-    cancel_url:            `${APP_URL}/pricing?payment=cancelled`,
+    mode:                 'subscription',
+    payment_method_types: ['card'],
+    customer_email:       email,
+    line_items:           [{ price: plan.priceId, quantity: 1 }],
+    metadata:             { userId: req.user.userId, plan: planKey },
+    success_url:          `${APP_URL}/?payment=success`,
+    cancel_url:           `${APP_URL}/pricing`,
   });
 
   return success(res, { checkoutUrl: session.url, sessionId: session.id });
@@ -91,35 +102,27 @@ async function handleWebhook(req, res, rawBody) {
       case 'checkout.session.completed': {
         const session = event.data.object;
         const userId  = session.metadata?.userId;
+        const plan    = session.metadata?.plan || 'pro'; // 'pro' | 'accountant'
         if (userId) {
           await supabase
-            .from('users')
-            .update({
-              plan:               'pro',
-              stripe_customer_id: session.customer,
-              subscription_id:    session.subscription,
-              updated_at:         new Date().toISOString(),
-            })
+            .from('profiles')
+            .update({ plan })
             .eq('id', userId);
-          console.log(`[webhook] User ${userId} upgraded to Pro`);
+          console.log(`[webhook] User ${userId} upgraded to ${plan}`);
         }
         break;
       }
 
       case 'customer.subscription.deleted': {
         const sub = event.data.object;
-        const { data: user } = await supabase
-          .from('users')
-          .select('id')
-          .eq('stripe_customer_id', sub.customer)
-          .single();
-
-        if (user) {
+        // Find user by email from Stripe customer object
+        const customer = await stripe.customers.retrieve(sub.customer);
+        if (customer && !customer.deleted && customer.email) {
           await supabase
-            .from('users')
-            .update({ plan: 'free', subscription_id: null, updated_at: new Date().toISOString() })
-            .eq('id', user.id);
-          console.log(`[webhook] User ${user.id} downgraded to Free`);
+            .from('profiles')
+            .update({ plan: 'free' })
+            .eq('email', customer.email);
+          console.log(`[webhook] Customer ${customer.email} downgraded to free`);
         }
         break;
       }

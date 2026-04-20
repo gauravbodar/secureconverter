@@ -551,3 +551,108 @@ On click: mailto:gaurav.bodar@gmail.com or Calendly embed.
 *SecureStatementConverter — Gaurav Bodar | April 2026 | CONFIDENTIAL*
 *Architecture: React+Vite (Vercel) + Python/pdfplumber (Railway) + Supabase + Stripe*
 *Data sovereignty: All processing on own infrastructure — no third-party PDF APIs*
+
+---
+
+## 17. Development Reference
+
+### Commands
+```bash
+npm run dev      # Vite dev server on port 3000
+npm run build    # Generates llms.txt then Vite build → dist/
+npm run lint     # ESLint (quiet mode)
+npm run preview  # Preview production build on port 3000
+
+# Python parser (run from parser/)
+pip install -r requirements.txt
+python app.py    # Flask dev server on port 5000
+```
+
+### Vercel API routing pattern
+All API handlers are **single files that handle multiple sub-routes** — NOT one file per endpoint. The pattern everywhere is:
+
+```
+vercel.json rewrite: /api/auth/:path*  →  /api/auth.js
+api/auth.js parses req.url pathname → dispatches to handleRegister / handleLogin / handleVerifyToken
+```
+
+When adding a new route, add it to the dispatch block inside the existing handler file and add a rewrite in `vercel.json` only if a new top-level path is needed.
+
+### Auth system (custom JWT — not Supabase Auth)
+- Users stored in Supabase `users` table with `password_hash` (bcrypt)
+- `lib/jwt.js` signs/verifies tokens; `middleware/auth.js` exports `requireAuth` and `optionalAuth`
+- `requireAuth` attaches `req.user = { userId, email }` or returns 401
+- `optionalAuth` attaches user silently, continues regardless
+- Supabase client in `lib/supabase.js` uses `SUPABASE_SECRET` (service role key) — not the anon key
+
+### Database tables (Supabase)
+Current tables the code references:
+- `users` — `id, email, first_name, password_hash, plan, stripe_customer_id, subscription_id`
+- `daily_limits` — `id, key, date, count` (IP or userId + date for quota tracking)
+- `conversions` — `user_id, filename, file_size, bank_type, conversion_time_ms, status`
+
+Plans stored in `users.plan`: `'free'` | `'pro'` | `'accountant'`
+
+### Stripe integration
+- `lib/stripe.js` exports `stripe` client and `PLANS` map
+- `PLANS` keys: `'pro-monthly'`, `'pro-yearly'` — priceIds from env vars
+- Webhook handler in `api/payment.js` handles `checkout.session.completed` (sets plan=pro) and `customer.subscription.deleted` (sets plan=free)
+- `STRIPE_WEBHOOK_SECRET` must be set; raw body is read manually before JSON.parse because Stripe needs the raw bytes for signature verification
+
+### PDF conversion flow
+```
+Browser → POST /api/conversion/convert (multipart PDF)
+  → api/conversion.js: formidable parses → reads Buffer → builds raw multipart
+  → Railway POST /parse (Buffer body, X-Secret header)
+  → parser/app.py: pdfplumber extract_words → detect_column_boundaries() → extract_rows_by_position()
+  → JSON { transactions[], validation{}, bank, accountName, ... }
+  → Vercel returns JSON to browser
+  → ResultsPage.jsx: buildCSV() generates CSV client-side for download
+```
+The PDF never leaves own infrastructure. `PARSER_URL` and `PARSER_SECRET` are Vercel env vars.
+
+### Frontend routing
+No React Router. `App.jsx` uses `useState('home' | 'results' | 'waitlist')` and renders the matching component. Adding a new page = add a state value and a conditional render block.
+
+### Response helpers
+All API handlers use `utils/response.js`:
+- `success(res, data, statusCode=200)` → `{ success: true, ...data }`
+- `error(res, message, code, statusCode)` → `{ success: false, error, code }`
+- `Errors.FOO(res)` — named errors with preset codes and status codes
+
+### Rate limiting
+`middleware/rateLimit.js` is in-memory (single Vercel instance). Pre-built: `authLimiter` (10/min), `conversionLimiter` (30/min), `signupLimiter` (10/min). Fine for MVP; replace with Upstash Redis for multi-instance scale.
+
+### Environment variables
+```
+# Parser
+PARSER_URL          Railway Python service URL
+PARSER_SECRET       Shared secret (Vercel → Railway)
+
+# Supabase
+SUPABASE_URL
+SUPABASE_SECRET     Service role key (backend only)
+SUPABASE_ANON_KEY   Public key (if needed for client-side)
+
+# Stripe
+STRIPE_SECRET_KEY
+STRIPE_PRICE_PRO_MONTHLY
+STRIPE_PRICE_PRO_YEARLY
+STRIPE_WEBHOOK_SECRET
+
+# Auth
+JWT_SECRET          Min 32 chars
+
+# App
+NEXT_PUBLIC_API_URL https://securestatementconverter.com
+```
+
+### Testing the parser locally
+```bash
+# From securestatement/ directory
+node tools/test-nab-parser.js test-pdfs/7311-20220630-statement.pdf
+# Validates: 110 txns, credits=25568.19, debits=25467.81, balance=12103.68
+
+node tools/debug-nab-items.js test-pdfs/7311-20220630-statement.pdf
+# Dumps pdfjs-dist word x/y positions for column boundary calibration
+```

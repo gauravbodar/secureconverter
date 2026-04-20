@@ -92,6 +92,49 @@ async function handleVerifyToken(req, res) {
   }
 }
 
+// ── Supabase Auth handlers ────────────────────────────────────────────────────
+
+async function handleSupabaseSignup(req, res) {
+  const { email, password } = req.body || {};
+
+  if (!isValidEmail(email))       return Errors.INVALID_EMAIL(res);
+  if (!isValidPassword(password)) return Errors.WEAK_PASSWORD(res);
+
+  const { data, error } = await supabase.auth.signUp({ email, password });
+
+  if (error) {
+    if (error.message?.toLowerCase().includes('already registered')) {
+      return Errors.USER_EXISTS(res);
+    }
+    throw error;
+  }
+
+  // Profile row is created automatically by the on_auth_user_created trigger.
+  // Manually upsert here as a safety net (e.g. if trigger isn't installed yet).
+  await supabase.from('profiles').upsert({
+    id: data.user.id,
+    email: data.user.email,
+    plan: 'free',
+  }).select().single();
+
+  return success(res, { user: { id: data.user.id, email: data.user.email }, session: data.session }, 201);
+}
+
+async function handleSupabaseLogin(req, res) {
+  const { email, password } = req.body || {};
+
+  if (!isValidEmail(email) || !password) return Errors.INVALID_CREDENTIALS(res);
+
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+
+  if (error) return Errors.INVALID_CREDENTIALS(res);
+
+  return success(res, {
+    session: data.session,
+    user: { id: data.user.id, email: data.user.email },
+  });
+}
+
 // ── main handler ──────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
@@ -104,12 +147,18 @@ export default async function handler(req, res) {
     await new Promise((resolve) => authLimiter(req, res, resolve));
     if (res.headersSent) return;
 
-    if (req.method === 'POST' && path.endsWith('/register')) {
-      return await handleRegister(req, res);
+    // Supabase Auth routes (new)
+    if (req.method === 'POST' && path.endsWith('/signup')) {
+      return await handleSupabaseSignup(req, res);
     }
 
     if (req.method === 'POST' && path.endsWith('/login')) {
-      return await handleLogin(req, res);
+      return await handleSupabaseLogin(req, res);
+    }
+
+    // Custom JWT routes (existing — kept for backward compat)
+    if (req.method === 'POST' && path.endsWith('/register')) {
+      return await handleRegister(req, res);
     }
 
     if (req.method === 'POST' && path.endsWith('/verify-token')) {
