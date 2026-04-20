@@ -1,6 +1,7 @@
 import formidable from 'formidable';
 import fs from 'fs';
 import { createClient } from '@supabase/supabase-js';
+import { verifyToken } from '../lib/jwt.js';
 
 export const config = { api: { bodyParser: false } };
 
@@ -31,30 +32,38 @@ async function checkQuota(req, pageCount) {
   const today = new Date().toISOString().slice(0, 10);
   const authHeader = req.headers.authorization;
 
-  // ── Authenticated user ───────────────────────────────────────────────────
+  // ── Authenticated user (custom JWT) ─────────────────────────────────────
   if (authHeader?.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
-    const { data: { user }, error } = await supabase.auth.getUser(token);
+    let payload;
+    try { payload = await verifyToken(token); } catch { /* invalid token — fall through to anon */ }
 
-    if (!error && user) {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('plan, pages_used_today, quota_reset_at')
-        .eq('id', user.id)
+    if (payload?.userId) {
+      const { data: userRow } = await supabase
+        .from('users')
+        .select('plan')
+        .eq('id', payload.userId)
         .single();
 
-      const plan = profile?.plan || 'free';
+      const plan = userRow?.plan || 'free';
 
       if (plan === 'pro' || plan === 'accountant') {
-        return { allowed: true, userId: user.id, plan };
+        return { allowed: true, userId: payload.userId, plan };
       }
 
-      const resetAt    = profile?.quota_reset_at ? new Date(profile.quota_reset_at) : new Date(0);
-      const todayStart = new Date(today);
-      const pagesUsed  = resetAt < todayStart ? 0 : (profile?.pages_used_today || 0);
+      // Free registered: track pages in daily_limits keyed by userId
+      const key = `user:${payload.userId}`;
+      const { data: limitRow } = await supabase
+        .from('daily_limits')
+        .select('*')
+        .eq('key', key)
+        .eq('date', today)
+        .single();
 
-      if (pagesUsed + pageCount > FREE_PAGE_LIMIT) {
-        const remaining = Math.max(0, FREE_PAGE_LIMIT - pagesUsed);
+      const used = limitRow?.count || 0;
+
+      if (used + pageCount > FREE_PAGE_LIMIT) {
+        const remaining = Math.max(0, FREE_PAGE_LIMIT - used);
         return {
           allowed: false,
           message: `Free plan allows ${FREE_PAGE_LIMIT} pages per day. You have ${remaining} page${remaining === 1 ? '' : 's'} remaining and this document has ${pageCount} pages.`,
@@ -63,12 +72,13 @@ async function checkQuota(req, pageCount) {
         };
       }
 
-      await supabase.from('profiles').update({
-        pages_used_today: pagesUsed + pageCount,
-        quota_reset_at: resetAt < todayStart ? new Date().toISOString() : profile.quota_reset_at,
-      }).eq('id', user.id);
+      if (!limitRow) {
+        await supabase.from('daily_limits').insert({ key, date: today, count: pageCount });
+      } else {
+        await supabase.from('daily_limits').update({ count: used + pageCount }).eq('id', limitRow.id);
+      }
 
-      return { allowed: true, userId: user.id, plan };
+      return { allowed: true, userId: payload.userId, plan };
     }
   }
 

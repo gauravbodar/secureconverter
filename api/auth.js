@@ -100,24 +100,35 @@ async function handleSupabaseSignup(req, res) {
   if (!isValidEmail(email))       return Errors.INVALID_EMAIL(res);
   if (!isValidPassword(password)) return Errors.WEAK_PASSWORD(res);
 
-  const { data, error } = await supabase.auth.signUp({ email, password });
+  const normEmail = normalizeEmail(email);
 
-  if (error) {
-    if (error.message?.toLowerCase().includes('already registered')) {
-      return Errors.USER_EXISTS(res);
-    }
-    throw error;
-  }
+  const { data: existing } = await supabase
+    .from('users')
+    .select('id')
+    .eq('email', normEmail)
+    .single();
 
-  // Profile row is created automatically by the on_auth_user_created trigger.
-  // Manually upsert here as a safety net (e.g. if trigger isn't installed yet).
-  await supabase.from('profiles').upsert({
-    id: data.user.id,
-    email: data.user.email,
-    plan: 'free',
-  }).select().single();
+  if (existing) return Errors.USER_EXISTS(res);
 
-  return success(res, { user: { id: data.user.id, email: data.user.email }, session: data.session }, 201);
+  const passwordHash = await bcrypt.hash(password, 10);
+
+  const { data: user, error } = await supabase
+    .from('users')
+    .insert({ email: normEmail, password_hash: passwordHash, plan: 'free' })
+    .select('id, email, plan')
+    .single();
+
+  if (error) throw error;
+
+  const token = signToken({ userId: user.id, email: user.email });
+
+  // Return token in both `token` and `session.access_token` so FileUpload.jsx
+  // (which reads session?.access_token) and any direct `token` readers both work.
+  return success(res, {
+    token,
+    session: { access_token: token },
+    user: { id: user.id, email: user.email },
+  }, 201);
 }
 
 async function handleSupabaseLogin(req, res) {
