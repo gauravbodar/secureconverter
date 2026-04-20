@@ -124,15 +124,33 @@ async function handleConvert(req, res) {
         'X-Secret': PARSER_SECRET || '',
       },
       body: formData,
+      timeout: 30000,
     });
 
-    if (!parseRes.ok) {
-      const errBody = await parseRes.text();
-      console.error('[conversion/convert] Railway error:', parseRes.status, errBody);
-      return Errors.CONVERSION_FAILED(res);
+    const rawText = await parseRes.text();
+    console.log('Railway status:', parseRes.status);
+    console.log('Railway response:', rawText);
+
+    let result;
+    try {
+      result = JSON.parse(rawText);
+    } catch (e) {
+      return res.status(502).json({
+        success: false,
+        error: 'Parser returned invalid JSON: ' + rawText.substring(0, 200),
+        code: 'PARSER_INVALID_RESPONSE',
+      });
     }
 
-    parsed = await parseRes.json();
+    if (!parseRes.ok) {
+      return res.status(502).json({
+        success: false,
+        error: 'Parser error: ' + (result.error || rawText),
+        code: 'PARSER_ERROR',
+      });
+    }
+
+    parsed = result;
   } catch (err) {
     console.error('[conversion/convert] proxy error:', err.message);
     return Errors.CONVERSION_FAILED(res);
@@ -156,7 +174,11 @@ async function handleConvert(req, res) {
     supabase.rpc('increment_conversion_count', { uid: user.userId }).then(() => {}).catch(() => {});
   }
 
-  return res.status(200).json(parsed);
+  // Return full parser result — let frontend handle empty transactions
+  return res.status(200).json({
+    success: true,
+    ...parsed,
+  });
 }
 
 // ── main handler ──────────────────────────────────────────────────────────────
