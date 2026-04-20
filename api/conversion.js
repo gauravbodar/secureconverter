@@ -9,9 +9,7 @@
  */
 
 import formidable from 'formidable';
-import { unlink } from 'fs/promises';
-import { createReadStream } from 'fs';
-import FormData from 'form-data';
+import fs from 'fs';
 import { setCors } from '../middleware/corsHeaders.js';
 import { optionalAuth } from '../middleware/auth.js';
 import { conversionLimiter } from '../middleware/rateLimit.js';
@@ -88,7 +86,7 @@ async function handleConvert(req, res) {
   }
 
   if (uploadedFile.mimetype !== 'application/pdf') {
-    await unlink(uploadedFile.filepath).catch(() => {});
+    await fs.promises.unlink(uploadedFile.filepath).catch(() => {});
     return Errors.INVALID_FILE_TYPE(res);
   }
 
@@ -97,65 +95,65 @@ async function handleConvert(req, res) {
   if (!user) {
     const quota = await checkAndIncrementQuota(null, ip);
     if (!quota.allowed) {
-      await unlink(uploadedFile.filepath).catch(() => {});
+      await fs.promises.unlink(uploadedFile.filepath).catch(() => {});
       return Errors.DAILY_LIMIT_REACHED(res);
     }
   }
 
   if (!PARSER_URL) {
-    unlink(uploadedFile.filepath).catch(() => {});
+    fs.promises.unlink(uploadedFile.filepath).catch(() => {});
     console.error('[conversion/convert] PARSER_URL not configured');
     return Errors.INTERNAL(res, 'Parser service not configured.');
   }
 
   const startMs = Date.now();
-  let parsed;
-  try {
-    const formData = new FormData();
-    formData.append('file', createReadStream(uploadedFile.filepath), {
-      filename: uploadedFile.originalFilename || 'statement.pdf',
-      contentType: 'application/pdf',
-    });
 
-    const parseRes = await fetch(`${PARSER_URL}/parse`, {
+  // Build FormData using npm 'form-data' — NOT browser FormData — so getHeaders() works
+  const FormData = (await import('form-data')).default;
+  const parserForm = new FormData();
+  parserForm.append('file', fs.createReadStream(uploadedFile.filepath), {
+    filename: uploadedFile.originalFilename || 'statement.pdf',
+    contentType: uploadedFile.mimetype || 'application/pdf',
+    knownLength: uploadedFile.size,
+  });
+
+  let result;
+  try {
+    const parserResponse = await fetch(`${PARSER_URL}/parse`, {
       method: 'POST',
       headers: {
-        ...formData.getHeaders(),
+        ...parserForm.getHeaders(),
         'X-Secret': PARSER_SECRET || '',
       },
-      body: formData,
-      timeout: 30000,
+      body: parserForm,
     });
 
-    const rawText = await parseRes.text();
-    console.log('Railway status:', parseRes.status);
-    console.log('Railway response:', rawText);
+    const rawText = await parserResponse.text();
+    console.log('Railway status:', parserResponse.status);
+    console.log('Railway raw response:', rawText.substring(0, 500));
 
-    let result;
     try {
       result = JSON.parse(rawText);
     } catch (e) {
       return res.status(502).json({
         success: false,
-        error: 'Parser returned invalid JSON: ' + rawText.substring(0, 200),
-        code: 'PARSER_INVALID_RESPONSE',
+        error: 'Parser returned invalid JSON: ' + rawText.substring(0, 300),
+        code: 'PARSER_INVALID_JSON',
       });
     }
 
-    if (!parseRes.ok) {
+    if (!parserResponse.ok) {
       return res.status(502).json({
         success: false,
-        error: 'Parser error: ' + (result.error || rawText),
+        error: result.error || 'Parser failed',
         code: 'PARSER_ERROR',
       });
     }
-
-    parsed = result;
   } catch (err) {
     console.error('[conversion/convert] proxy error:', err.message);
     return Errors.CONVERSION_FAILED(res);
   } finally {
-    unlink(uploadedFile.filepath).catch(() => {});
+    try { fs.unlinkSync(uploadedFile.filepath); } catch {}
   }
 
   const conversionTimeMs = Date.now() - startMs;
@@ -165,7 +163,7 @@ async function handleConvert(req, res) {
     user_id:            user?.userId || null,
     filename:           uploadedFile.originalFilename || 'statement.pdf',
     file_size:          uploadedFile.size,
-    bank_type:          parsed.bank,
+    bank_type:          result.bank,
     conversion_time_ms: conversionTimeMs,
     status:             'success',
   }).then(() => {}).catch(() => {});
@@ -174,11 +172,7 @@ async function handleConvert(req, res) {
     supabase.rpc('increment_conversion_count', { uid: user.userId }).then(() => {}).catch(() => {});
   }
 
-  // Return full parser result — let frontend handle empty transactions
-  return res.status(200).json({
-    success: true,
-    ...parsed,
-  });
+  return res.status(200).json({ success: true, ...result });
 }
 
 // ── main handler ──────────────────────────────────────────────────────────────
