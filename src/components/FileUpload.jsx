@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, File, X, CheckCircle, AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
@@ -10,24 +10,17 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [pageCount, setPageCount] = useState(0);
+  const [quotaModal, setQuotaModal] = useState({ visible: false });
   const { toast } = useToast();
 
-  const estimatePageCount = (fileSize) => {
-    // Rough estimate: 50KB per page average
-    return Math.ceil(fileSize / (50 * 1024));
-  };
+  const estimatePageCount = (fileSize) => Math.ceil(fileSize / (50 * 1024));
 
-  const handleDrag = useCallback((e) => {
-    e.preventDefault();
-    e.stopPropagation();
-  }, []);
+  const handleDrag = useCallback((e) => { e.preventDefault(); e.stopPropagation(); }, []);
 
   const handleDragIn = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
-    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
-      setIsDragging(true);
-    }
+    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) setIsDragging(true);
   }, []);
 
   const handleDragOut = useCallback((e) => {
@@ -36,27 +29,15 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
     setIsDragging(false);
   }, []);
 
-  const validateFile = (file) => {
-    if (file.type !== 'application/pdf') {
-      toast({
-        title: "Invalid file type",
-        description: "Please upload a PDF file only.",
-        variant: "destructive"
-      });
+  const validateFile = (f) => {
+    if (f.type !== 'application/pdf') {
+      toast({ title: 'Invalid file type', description: 'Please upload a PDF file only.', variant: 'destructive' });
       return false;
     }
-    
-    // Task 2: Client-side file size validation (Max 3MB)
-    const maxSize = 3145728; // 3MB in bytes
-    if (file.size > maxSize) {
-      toast({
-        title: "File too large (Max 3MB)",
-        description: "Please upload a file smaller than 3MB.",
-        variant: "destructive"
-      });
+    if (f.size > 3145728) {
+      toast({ title: 'File too large (Max 3MB)', description: 'Please upload a file smaller than 3MB.', variant: 'destructive' });
       return false;
     }
-    
     return true;
   };
 
@@ -64,12 +45,10 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(false);
-
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const droppedFile = e.dataTransfer.files[0];
       if (validateFile(droppedFile)) {
-        const estimatedPages = estimatePageCount(droppedFile.size);
-        setPageCount(estimatedPages);
+        setPageCount(estimatePageCount(droppedFile.size));
         setFile(droppedFile);
       }
       e.dataTransfer.clearData();
@@ -78,77 +57,69 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
 
   const handleFileInput = (e) => {
     if (e.target.files && e.target.files.length > 0) {
-      const selectedFile = e.target.files[0];
-      if (validateFile(selectedFile)) {
-        const estimatedPages = estimatePageCount(selectedFile.size);
-        setPageCount(estimatedPages);
-        setFile(selectedFile);
+      const selected = e.target.files[0];
+      if (validateFile(selected)) {
+        setPageCount(estimatePageCount(selected.size));
+        setFile(selected);
       }
     }
   };
 
-  const handleRemoveFile = () => {
-    setFile(null);
-    setPageCount(0);
-  };
+  const handleRemoveFile = () => { setFile(null); setPageCount(0); };
 
   const handleUpload = async () => {
     if (!file) {
-      toast({
-        title: "No file selected",
-        description: "Please select a PDF file to convert.",
-        variant: "destructive"
-      });
+      toast({ title: 'No file selected', description: 'Please select a PDF file to convert.', variant: 'destructive' });
       return;
     }
-
-    // Double check validation before upload
-    if (!validateFile(file)) {
-      return;
-    }
+    if (!validateFile(file)) return;
 
     setUploading(true);
 
     try {
       const formData = new FormData();
       formData.append('file', file);
-      // Task 1: user_ip is NOT appended here, relying on backend detection.
 
-      // Use centralized endpoint configuration
-      const response = await fetch(CONVERT_ENDPOINT, {
-        method: 'POST',
-        body: formData,
-      });
+      const response = await fetch(CONVERT_ENDPOINT, { method: 'POST', body: formData });
 
-      // Handle quota / daily limit responses
-      if (response.status === 403 || response.status === 429) {
-        const data = await response.json().catch(() => ({}));
-        if (onLimitReached) onLimitReached(data);
-        setUploading(false);
+      // Always parse JSON first — needed for quota error details
+      const data = await response.json();
+
+      // Handle quota exceeded — show modal, do NOT throw
+      if (data.code === 'QUOTA_EXCEEDED') {
+        setQuotaModal({
+          visible: true,
+          type: data.requiresSignup ? 'signup' : 'upgrade',
+          message: data.error,
+          pageCount: data.pageCount,
+        });
         return;
       }
 
+      // Legacy 403 path (IP-based daily limit without JSON detail)
+      if (response.status === 403) {
+        if (onLimitReached) onLimitReached(data);
+        return;
+      }
+
+      // Unexpected server error
       if (!response.ok) {
-        throw new Error(`Upload failed with status: ${response.status}`);
+        throw new Error(data.error || `Upload failed with status: ${response.status}`);
       }
 
-      const data = await response.json();
-
-      if (data.error) {
-        throw new Error(data.error);
-      }
+      if (data.error) throw new Error(data.error);
 
       if (onConversionComplete) {
         onConversionComplete({
-          transactions: data.transactions,
-          bank: data.bank,
-          accountName: data.accountName,
-          accountNumber: data.accountNumber,
-          bsb: data.bsb,
+          transactions:    data.transactions,
+          bank:            data.bank,
+          accountName:     data.accountName,
+          accountNumber:   data.accountNumber,
+          bsb:             data.bsb,
           statementPeriod: data.statementPeriod,
-          openingBalance: data.openingBalance,
-          closingBalance: data.closingBalance,
-          validation: data.validation,
+          openingBalance:  data.openingBalance,
+          closingBalance:  data.closingBalance,
+          validation:      data.validation,
           originalFilename: file.name,
           pageCount,
         });
@@ -160,9 +131,9 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
     } catch (error) {
       console.error('Upload error:', error);
       toast({
-        title: "Conversion Failed",
-        description: "An error occurred while communicating with the server. Please try again later.",
-        variant: "destructive"
+        title: 'Conversion Failed',
+        description: error.message || 'An error occurred. Please try again.',
+        variant: 'destructive',
       });
     } finally {
       setUploading(false);
@@ -171,7 +142,68 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
 
   return (
     <>
-      <section className="py-16 px-4 bg-gradient-to-b from-gray-50 to-white">
+      {/* Quota exceeded modal */}
+      <AnimatePresence>
+        {quotaModal.visible && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 px-4"
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              transition={{ duration: 0.2 }}
+              className="bg-white rounded-xl p-8 max-w-md w-full shadow-2xl"
+            >
+              <h2 className="text-xl font-bold text-[#0A2342] mb-3">
+                {quotaModal.type === 'signup'
+                  ? 'Sign up to convert this statement'
+                  : 'Upgrade for unlimited pages'}
+              </h2>
+              <p className="text-gray-600 mb-6 text-sm leading-relaxed">{quotaModal.message}</p>
+
+              <div className="flex flex-col gap-3">
+                {quotaModal.type === 'signup' && (
+                  <Button
+                    onClick={() => {
+                      setQuotaModal({ visible: false });
+                      document.getElementById('pricing')?.scrollIntoView({ behavior: 'smooth' });
+                    }}
+                    className="w-full bg-[#0A2342] hover:bg-[#0d2e57] text-white font-semibold py-3"
+                  >
+                    Sign Up Free — 6 pages/day
+                  </Button>
+                )}
+                <Button
+                  onClick={() => {
+                    setQuotaModal({ visible: false });
+                    document.getElementById('pricing')?.scrollIntoView({ behavior: 'smooth' });
+                  }}
+                  variant={quotaModal.type === 'signup' ? 'outline' : 'default'}
+                  className={`w-full font-semibold py-3 ${
+                    quotaModal.type === 'signup'
+                      ? 'border-[#0A2342] text-[#0A2342] hover:bg-[#0A2342] hover:text-white'
+                      : 'bg-[#0A2342] hover:bg-[#0d2e57] text-white'
+                  }`}
+                >
+                  Upgrade to Pro — Unlimited pages · $19/mo
+                </Button>
+                <button
+                  onClick={() => setQuotaModal({ visible: false })}
+                  className="w-full text-gray-500 hover:text-gray-700 text-sm py-2 transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <section id="upload" className="py-16 px-4 bg-gradient-to-b from-gray-50 to-white">
         <div className="container mx-auto max-w-3xl">
           <motion.div
             initial={{ opacity: 0, y: 30 }}
@@ -180,18 +212,14 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
             transition={{ duration: 0.6 }}
           >
             <motion.div
-              animate={file ? {} : { 
+              animate={file ? {} : {
                 boxShadow: [
                   '0 0 0 0 rgba(16, 185, 129, 0)',
                   '0 0 0 10px rgba(16, 185, 129, 0.1)',
-                  '0 0 0 0 rgba(16, 185, 129, 0)'
-                ]
+                  '0 0 0 0 rgba(16, 185, 129, 0)',
+                ],
               }}
-              transition={file ? {} : {
-                duration: 2,
-                repeat: Infinity,
-                repeatDelay: 1
-              }}
+              transition={file ? {} : { duration: 2, repeat: Infinity, repeatDelay: 1 }}
               onDragEnter={handleDragIn}
               onDragLeave={handleDragOut}
               onDragOver={handleDrag}
@@ -239,10 +267,7 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
                     </div>
                   </div>
                   <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleRemoveFile();
-                    }}
+                    onClick={(e) => { e.stopPropagation(); handleRemoveFile(); }}
                     className="text-red-500 hover:text-red-700 transition-colors"
                     disabled={uploading}
                   >
@@ -265,7 +290,7 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
                 >
                   {uploading ? (
                     <span className="flex items-center justify-center gap-2">
-                      <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                      <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
                       Converting...
                     </span>
                   ) : (
