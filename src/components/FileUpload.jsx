@@ -120,9 +120,10 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
         body: formData,
       });
 
-      // Handle 403 Forbidden - Daily Limit Reached
-      if (response.status === 403) {
-        onLimitReached();
+      // Handle quota / daily limit responses
+      if (response.status === 403 || response.status === 429) {
+        const data = await response.json().catch(() => ({}));
+        if (onLimitReached) onLimitReached(data);
         setUploading(false);
         return;
       }

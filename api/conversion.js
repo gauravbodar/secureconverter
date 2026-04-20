@@ -4,8 +4,8 @@ import { createClient } from '@supabase/supabase-js';
 
 export const config = { api: { bodyParser: false } };
 
-const ANON_PAGE_LIMIT = 3;   // anonymous (no token)
-const FREE_PAGE_LIMIT = 6;   // registered free plan
+const ANON_PAGE_LIMIT = 3;
+const FREE_PAGE_LIMIT = 6;
 
 function getSupabase() {
   return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET, {
@@ -22,7 +22,11 @@ function getClientIP(req) {
   );
 }
 
-async function checkQuota(req, res) {
+/**
+ * Returns { allowed, message, requiresSignup, requiresUpgrade }
+ * Increments quota by pageCount if allowed.
+ */
+async function checkQuota(req, pageCount) {
   const supabase = getSupabase();
   const today = new Date().toISOString().slice(0, 10);
   const authHeader = req.headers.authorization;
@@ -41,29 +45,26 @@ async function checkQuota(req, res) {
 
       const plan = profile?.plan || 'free';
 
-      // Pro and accountant have unlimited conversions
       if (plan === 'pro' || plan === 'accountant') {
         return { allowed: true, userId: user.id, plan };
       }
 
-      // Free registered: 6 pages per day
-      const resetAt = profile?.quota_reset_at ? new Date(profile.quota_reset_at) : new Date(0);
+      const resetAt    = profile?.quota_reset_at ? new Date(profile.quota_reset_at) : new Date(0);
       const todayStart = new Date(today);
-      const pagesUsed = resetAt < todayStart ? 0 : (profile?.pages_used_today || 0);
+      const pagesUsed  = resetAt < todayStart ? 0 : (profile?.pages_used_today || 0);
 
-      if (pagesUsed >= FREE_PAGE_LIMIT) {
-        res.status(429).json({
-          success: false,
-          error: `Free plan allows ${FREE_PAGE_LIMIT} pages per day. Upgrade to Pro for unlimited.`,
-          code: 'QUOTA_EXCEEDED',
-          upgradeUrl: '/pricing',
-        });
-        return { allowed: false };
+      if (pagesUsed + pageCount > FREE_PAGE_LIMIT) {
+        const remaining = Math.max(0, FREE_PAGE_LIMIT - pagesUsed);
+        return {
+          allowed: false,
+          message: `Free plan allows ${FREE_PAGE_LIMIT} pages per day. You have ${remaining} page${remaining === 1 ? '' : 's'} remaining and this document has ${pageCount} pages.`,
+          requiresSignup: false,
+          requiresUpgrade: true,
+        };
       }
 
-      // Increment counter
       await supabase.from('profiles').update({
-        pages_used_today: pagesUsed + 1,
+        pages_used_today: pagesUsed + pageCount,
         quota_reset_at: resetAt < todayStart ? new Date().toISOString() : profile.quota_reset_at,
       }).eq('id', user.id);
 
@@ -72,7 +73,7 @@ async function checkQuota(req, res) {
   }
 
   // ── Anonymous user (IP-based) ─────────────────────────────────────────────
-  const ip = getClientIP(req);
+  const ip  = getClientIP(req);
   const key = `anon:${ip}`;
 
   const { data: limitRow } = await supabase
@@ -82,25 +83,26 @@ async function checkQuota(req, res) {
     .eq('date', today)
     .single();
 
+  const used = limitRow?.count || 0;
+
+  if (used + pageCount > ANON_PAGE_LIMIT) {
+    const remaining = Math.max(0, ANON_PAGE_LIMIT - used);
+    return {
+      allowed: false,
+      message: `Free limit is ${ANON_PAGE_LIMIT} pages per day. You have ${remaining} page${remaining === 1 ? '' : 's'} remaining and this document has ${pageCount} pages. Sign up free to get ${FREE_PAGE_LIMIT} pages per day.`,
+      requiresSignup: true,
+      requiresUpgrade: false,
+    };
+  }
+
   if (!limitRow) {
-    await supabase.from('daily_limits').insert({ key, date: today, count: 1 });
-    return { allowed: true, plan: 'anonymous' };
+    await supabase.from('daily_limits').insert({ key, date: today, count: pageCount });
+  } else {
+    await supabase
+      .from('daily_limits')
+      .update({ count: used + pageCount })
+      .eq('id', limitRow.id);
   }
-
-  if (limitRow.count >= ANON_PAGE_LIMIT) {
-    res.status(403).json({
-      success: false,
-      error: `Free limit is ${ANON_PAGE_LIMIT} conversions per day. Sign up free to get ${FREE_PAGE_LIMIT} per day.`,
-      code: 'DAILY_LIMIT_REACHED',
-      upgradeUrl: '/pricing',
-    });
-    return { allowed: false };
-  }
-
-  await supabase
-    .from('daily_limits')
-    .update({ count: limitRow.count + 1 })
-    .eq('id', limitRow.id);
 
   return { allowed: true, plan: 'anonymous' };
 }
@@ -110,52 +112,39 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Step 1 — Parse incoming upload with formidable
-  const form = formidable({
-    maxFileSize: 20 * 1024 * 1024,
-    keepExtensions: true
-  });
+  // Step 1 — Parse multipart upload
+  const form = formidable({ maxFileSize: 20 * 1024 * 1024, keepExtensions: true });
 
-  let fields, files;
+  let files;
   try {
-    [fields, files] = await form.parse(req);
+    [, files] = await form.parse(req);
   } catch (e) {
-    return res.status(400).json({
-      success: false,
-      error: 'Could not read uploaded file: ' + e.message
-    });
+    return res.status(400).json({ success: false, error: 'Could not read uploaded file: ' + e.message });
   }
 
-  // Step 2 — Get the uploaded file
   const uploadedFile = files.file?.[0] || files.pdf?.[0];
   if (!uploadedFile) {
-    return res.status(400).json({
-      success: false,
-      error: 'No file found in upload. Field name must be "file".'
-    });
+    return res.status(400).json({ success: false, error: 'No file found in upload. Field name must be "file".' });
   }
 
-  // Step 3 — Quota check BEFORE forwarding to parser
-  const quota = await checkQuota(req, res);
-  if (!quota.allowed) {
-    try { fs.unlinkSync(uploadedFile.filepath); } catch {}
-    return; // response already sent inside checkQuota
+  const PARSER_URL    = process.env.PARSER_URL;
+  const PARSER_SECRET = process.env.PARSER_SECRET;
+
+  if (!PARSER_URL) {
+    return res.status(500).json({ success: false, error: 'PARSER_URL environment variable not set on Vercel' });
   }
 
-  // Step 4 — Read file into Buffer (not a stream)
+  // Step 2 — Read file into Buffer
   let fileBuffer;
   try {
     fileBuffer = fs.readFileSync(uploadedFile.filepath);
   } catch (e) {
-    return res.status(500).json({
-      success: false,
-      error: 'Could not read temp file: ' + e.message
-    });
+    return res.status(500).json({ success: false, error: 'Could not read temp file: ' + e.message });
   }
 
-  // Step 5 — Build multipart body manually using Buffer
+  // Step 3 — Build multipart body (reused for both /page-count and /parse)
   const boundary = '----VercelParserBoundary' + Date.now();
-  const filename = uploadedFile.originalFilename || 'statement.pdf';
+  const filename  = uploadedFile.originalFilename || 'statement.pdf';
 
   const beforeFile = Buffer.from(
     `--${boundary}\r\n` +
@@ -165,39 +154,49 @@ export default async function handler(req, res) {
   const afterFile = Buffer.from(`\r\n--${boundary}--\r\n`);
   const body = Buffer.concat([beforeFile, fileBuffer, afterFile]);
 
-  // Step 6 — Forward to Railway Python parser
-  const PARSER_URL = process.env.PARSER_URL;
-  const PARSER_SECRET = process.env.PARSER_SECRET;
+  const parserHeaders = {
+    'Content-Type': `multipart/form-data; boundary=${boundary}`,
+    'Content-Length': body.length.toString(),
+    'X-Secret': PARSER_SECRET || '',
+  };
 
-  if (!PARSER_URL) {
-    return res.status(500).json({
-      success: false,
-      error: 'PARSER_URL environment variable not set on Vercel'
-    });
-  }
-
-  let parserRes;
+  // Step 4 — Get actual page count from Railway
+  let pageCount = 1;
   try {
-    parserRes = await fetch(`${PARSER_URL}/parse`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': body.length.toString(),
-        'X-Secret': PARSER_SECRET || ''
-      },
-      body: body
-    });
+    const pcRes  = await fetch(`${PARSER_URL}/page-count`, { method: 'POST', headers: parserHeaders, body });
+    const pcData = await pcRes.json();
+    if (typeof pcData.pageCount === 'number') {
+      pageCount = pcData.pageCount;
+    }
   } catch (e) {
-    return res.status(502).json({
-      success: false,
-      error: 'Could not reach parser service: ' + e.message
-    });
+    // If /page-count fails, fall through with pageCount=1 (fail open for quota, not fatal)
+    console.warn('[conversion] /page-count failed:', e.message);
   }
 
-  // Step 7 — Clean up temp file
+  // Step 5 — Quota check with actual page count
   try { fs.unlinkSync(uploadedFile.filepath); } catch {}
 
-  // Step 8 — Return parser response
+  const quota = await checkQuota(req, pageCount);
+  if (!quota.allowed) {
+    return res.status(429).json({
+      success: false,
+      error: quota.message,
+      code: 'QUOTA_EXCEEDED',
+      pageCount,
+      requiresSignup:  quota.requiresSignup  || false,
+      requiresUpgrade: quota.requiresUpgrade || false,
+    });
+  }
+
+  // Step 6 — Forward to Railway Python parser
+  let parserRes;
+  try {
+    parserRes = await fetch(`${PARSER_URL}/parse`, { method: 'POST', headers: parserHeaders, body });
+  } catch (e) {
+    return res.status(502).json({ success: false, error: 'Could not reach parser service: ' + e.message });
+  }
+
+  // Step 7 — Return parser response
   const rawText = await parserRes.text();
   console.log('Railway status:', parserRes.status);
   console.log('Railway response preview:', rawText.substring(0, 300));
@@ -206,17 +205,11 @@ export default async function handler(req, res) {
   try {
     result = JSON.parse(rawText);
   } catch (e) {
-    return res.status(502).json({
-      success: false,
-      error: 'Parser returned invalid response: ' + rawText.substring(0, 200)
-    });
+    return res.status(502).json({ success: false, error: 'Parser returned invalid response: ' + rawText.substring(0, 200) });
   }
 
   if (!parserRes.ok) {
-    return res.status(502).json({
-      success: false,
-      error: result.error || 'Parser failed with status ' + parserRes.status
-    });
+    return res.status(502).json({ success: false, error: result.error || 'Parser failed with status ' + parserRes.status });
   }
 
   return res.status(200).json({ success: true, ...result });
