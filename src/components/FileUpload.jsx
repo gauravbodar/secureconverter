@@ -3,31 +3,26 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, File, X, CheckCircle, AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
-import { CONVERT_ENDPOINT } from '@/config/api';
+import { CONVERT_ENDPOINT, SIGNUP_ENDPOINT } from '@/config/api';
 
 const FileUpload = ({ onConversionComplete, onLimitReached }) => {
-  const [file, setFile] = useState(null);
+  const [file, setFile]           = useState(null);
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [pageCount, setPageCount] = useState(0);
   const [quotaModal, setQuotaModal] = useState({ visible: false });
+  const [authToken, setAuthToken] = useState(null);
+  const [signupForm, setSignupForm] = useState({ email: '', password: '', loading: false, error: '' });
   const { toast } = useToast();
 
   const estimatePageCount = (fileSize) => Math.ceil(fileSize / (50 * 1024));
 
-  const handleDrag = useCallback((e) => { e.preventDefault(); e.stopPropagation(); }, []);
-
-  const handleDragIn = useCallback((e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) setIsDragging(true);
+  const handleDrag    = useCallback((e) => { e.preventDefault(); e.stopPropagation(); }, []);
+  const handleDragIn  = useCallback((e) => {
+    e.preventDefault(); e.stopPropagation();
+    if (e.dataTransfer.items?.length > 0) setIsDragging(true);
   }, []);
-
-  const handleDragOut = useCallback((e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-  }, []);
+  const handleDragOut = useCallback((e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); }, []);
 
   const validateFile = (f) => {
     if (f.type !== 'application/pdf') {
@@ -42,32 +37,26 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
   };
 
   const handleDrop = useCallback((e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      const droppedFile = e.dataTransfer.files[0];
-      if (validateFile(droppedFile)) {
-        setPageCount(estimatePageCount(droppedFile.size));
-        setFile(droppedFile);
-      }
+    e.preventDefault(); e.stopPropagation(); setIsDragging(false);
+    if (e.dataTransfer.files?.length > 0) {
+      const f = e.dataTransfer.files[0];
+      if (validateFile(f)) { setPageCount(estimatePageCount(f.size)); setFile(f); }
       e.dataTransfer.clearData();
     }
   }, []);
 
   const handleFileInput = (e) => {
-    if (e.target.files && e.target.files.length > 0) {
-      const selected = e.target.files[0];
-      if (validateFile(selected)) {
-        setPageCount(estimatePageCount(selected.size));
-        setFile(selected);
-      }
+    if (e.target.files?.length > 0) {
+      const f = e.target.files[0];
+      if (validateFile(f)) { setPageCount(estimatePageCount(f.size)); setFile(f); }
     }
   };
 
   const handleRemoveFile = () => { setFile(null); setPageCount(0); };
 
-  const handleUpload = async () => {
+  // ── Core upload function ───────────────────────────────────────────────────
+  // overrideToken: token from post-signup retry; falls back to state → localStorage
+  const handleUpload = async (overrideToken = null) => {
     if (!file) {
       toast({ title: 'No file selected', description: 'Please select a PDF file to convert.', variant: 'destructive' });
       return;
@@ -80,7 +69,11 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
       const formData = new FormData();
       formData.append('file', file);
 
-      const response = await fetch(CONVERT_ENDPOINT, { method: 'POST', body: formData });
+      // Resolve auth token: retry param → component state → localStorage
+      const token = overrideToken || authToken || localStorage.getItem('sb_access_token');
+      const headers = token ? { Authorization: `Bearer ${token}` } : {};
+
+      const response = await fetch(CONVERT_ENDPOINT, { method: 'POST', headers, body: formData });
 
       // Always parse JSON first — needed for quota error details
       const data = await response.json();
@@ -92,34 +85,31 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
           type: data.requiresSignup ? 'signup' : 'upgrade',
           message: data.error,
           pageCount: data.pageCount,
+          signupSuccess: false,
         });
         return;
       }
 
-      // Legacy 403 path (IP-based daily limit without JSON detail)
+      // Legacy 403 (IP-based limit without JSON quota detail)
       if (response.status === 403) {
         if (onLimitReached) onLimitReached(data);
         return;
       }
 
-      // Unexpected server error
-      if (!response.ok) {
-        throw new Error(data.error || `Upload failed with status: ${response.status}`);
-      }
-
+      if (!response.ok) throw new Error(data.error || `Upload failed with status: ${response.status}`);
       if (data.error) throw new Error(data.error);
 
       if (onConversionComplete) {
         onConversionComplete({
-          transactions:    data.transactions,
-          bank:            data.bank,
-          accountName:     data.accountName,
-          accountNumber:   data.accountNumber,
-          bsb:             data.bsb,
-          statementPeriod: data.statementPeriod,
-          openingBalance:  data.openingBalance,
-          closingBalance:  data.closingBalance,
-          validation:      data.validation,
+          transactions:     data.transactions,
+          bank:             data.bank,
+          accountName:      data.accountName,
+          accountNumber:    data.accountNumber,
+          bsb:              data.bsb,
+          statementPeriod:  data.statementPeriod,
+          openingBalance:   data.openingBalance,
+          closingBalance:   data.closingBalance,
+          validation:       data.validation,
           originalFilename: file.name,
           pageCount,
         });
@@ -130,19 +120,169 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
 
     } catch (error) {
       console.error('Upload error:', error);
-      toast({
-        title: 'Conversion Failed',
-        description: error.message || 'An error occurred. Please try again.',
-        variant: 'destructive',
-      });
+      toast({ title: 'Conversion Failed', description: error.message || 'An error occurred. Please try again.', variant: 'destructive' });
     } finally {
       setUploading(false);
     }
   };
 
+  // ── Inline signup (inside quota modal) ────────────────────────────────────
+  const handleSignup = async () => {
+    if (!signupForm.email || !signupForm.password) {
+      setSignupForm(f => ({ ...f, error: 'Please enter your email and a password.' }));
+      return;
+    }
+    setSignupForm(f => ({ ...f, loading: true, error: '' }));
+    try {
+      const res  = await fetch(SIGNUP_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: signupForm.email, password: signupForm.password }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Signup failed. Please try again.');
+
+      const token = data.session?.access_token;
+      if (token) {
+        localStorage.setItem('sb_access_token', token);
+        setAuthToken(token);
+      }
+
+      // Show "Access Unlocked" state — user clicks "Continue Converting" to retry
+      setQuotaModal(m => ({ ...m, signupSuccess: true }));
+    } catch (err) {
+      setSignupForm(f => ({ ...f, error: err.message }));
+    } finally {
+      setSignupForm(f => ({ ...f, loading: false }));
+    }
+  };
+
+  // ── Retry after signup ─────────────────────────────────────────────────────
+  // file is still in state (quota path returns early without clearing it)
+  const retryConversion = async () => {
+    const token = authToken || localStorage.getItem('sb_access_token');
+    setQuotaModal({ visible: false });
+    setSignupForm({ email: '', password: '', loading: false, error: '' });
+    await handleUpload(token);
+  };
+
+  const closeModal = () => {
+    setQuotaModal({ visible: false });
+    setSignupForm({ email: '', password: '', loading: false, error: '' });
+  };
+
+  // ── Modal content ──────────────────────────────────────────────────────────
+  const renderModalContent = () => {
+    // "Access Unlocked" state after successful signup
+    if (quotaModal.signupSuccess) {
+      return (
+        <div className="text-center">
+          <div className="w-14 h-14 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+            <CheckCircle className="w-8 h-8 text-green-600" />
+          </div>
+          <h2 className="text-xl font-bold text-[#0A2342] mb-2">Access Unlocked</h2>
+          <p className="text-gray-600 text-sm mb-6">
+            Your free account is ready — you have 6 pages per day.
+          </p>
+          <Button
+            onClick={retryConversion}
+            className="w-full bg-[#0A2342] hover:bg-[#0d2e57] text-white font-semibold py-3"
+          >
+            <CheckCircle className="w-4 h-4 mr-2" />
+            Continue Converting
+          </Button>
+        </div>
+      );
+    }
+
+    // Signup modal with inline form
+    if (quotaModal.type === 'signup') {
+      return (
+        <>
+          <h2 className="text-xl font-bold text-[#0A2342] mb-2">
+            Sign up to convert this statement
+          </h2>
+          <p className="text-gray-600 text-sm mb-5 leading-relaxed">{quotaModal.message}</p>
+
+          <div className="flex flex-col gap-3 mb-4">
+            <input
+              type="email"
+              placeholder="Email address"
+              value={signupForm.email}
+              onChange={e => setSignupForm(f => ({ ...f, email: e.target.value }))}
+              onKeyDown={e => e.key === 'Enter' && handleSignup()}
+              className="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0A2342] focus:border-transparent"
+            />
+            <input
+              type="password"
+              placeholder="Password (min 6 characters)"
+              value={signupForm.password}
+              onChange={e => setSignupForm(f => ({ ...f, password: e.target.value }))}
+              onKeyDown={e => e.key === 'Enter' && handleSignup()}
+              className="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0A2342] focus:border-transparent"
+            />
+            {signupForm.error && (
+              <p className="text-red-600 text-xs">{signupForm.error}</p>
+            )}
+          </div>
+
+          <div className="flex flex-col gap-3">
+            <Button
+              onClick={handleSignup}
+              disabled={signupForm.loading}
+              className="w-full bg-[#0A2342] hover:bg-[#0d2e57] text-white font-semibold py-3"
+            >
+              {signupForm.loading ? (
+                <span className="flex items-center justify-center gap-2">
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Creating account…
+                </span>
+              ) : 'Create Free Account — 6 pages/day'}
+            </Button>
+            <Button
+              onClick={closeModal}
+              variant="outline"
+              className="w-full border-[#0A2342] text-[#0A2342] hover:bg-[#0A2342] hover:text-white font-semibold py-3"
+            >
+              Upgrade to Pro · $19/mo
+            </Button>
+            <button
+              onClick={closeModal}
+              className="w-full text-gray-500 hover:text-gray-700 text-sm py-2 transition-colors"
+            >
+              Cancel
+            </button>
+          </div>
+        </>
+      );
+    }
+
+    // Upgrade modal (pro/accountant user at limit, or free-registered at limit)
+    return (
+      <>
+        <h2 className="text-xl font-bold text-[#0A2342] mb-2">Upgrade for unlimited pages</h2>
+        <p className="text-gray-600 text-sm mb-6 leading-relaxed">{quotaModal.message}</p>
+        <div className="flex flex-col gap-3">
+          <Button
+            onClick={() => { closeModal(); document.getElementById('pricing')?.scrollIntoView({ behavior: 'smooth' }); }}
+            className="w-full bg-[#0A2342] hover:bg-[#0d2e57] text-white font-semibold py-3"
+          >
+            Upgrade to Pro — Unlimited pages · $19/mo
+          </Button>
+          <button
+            onClick={closeModal}
+            className="w-full text-gray-500 hover:text-gray-700 text-sm py-2 transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </>
+    );
+  };
+
   return (
     <>
-      {/* Quota exceeded modal */}
+      {/* Quota / signup modal */}
       <AnimatePresence>
         {quotaModal.visible && (
           <motion.div
@@ -158,46 +298,7 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
               transition={{ duration: 0.2 }}
               className="bg-white rounded-xl p-8 max-w-md w-full shadow-2xl"
             >
-              <h2 className="text-xl font-bold text-[#0A2342] mb-3">
-                {quotaModal.type === 'signup'
-                  ? 'Sign up to convert this statement'
-                  : 'Upgrade for unlimited pages'}
-              </h2>
-              <p className="text-gray-600 mb-6 text-sm leading-relaxed">{quotaModal.message}</p>
-
-              <div className="flex flex-col gap-3">
-                {quotaModal.type === 'signup' && (
-                  <Button
-                    onClick={() => {
-                      setQuotaModal({ visible: false });
-                      document.getElementById('pricing')?.scrollIntoView({ behavior: 'smooth' });
-                    }}
-                    className="w-full bg-[#0A2342] hover:bg-[#0d2e57] text-white font-semibold py-3"
-                  >
-                    Sign Up Free — 6 pages/day
-                  </Button>
-                )}
-                <Button
-                  onClick={() => {
-                    setQuotaModal({ visible: false });
-                    document.getElementById('pricing')?.scrollIntoView({ behavior: 'smooth' });
-                  }}
-                  variant={quotaModal.type === 'signup' ? 'outline' : 'default'}
-                  className={`w-full font-semibold py-3 ${
-                    quotaModal.type === 'signup'
-                      ? 'border-[#0A2342] text-[#0A2342] hover:bg-[#0A2342] hover:text-white'
-                      : 'bg-[#0A2342] hover:bg-[#0d2e57] text-white'
-                  }`}
-                >
-                  Upgrade to Pro — Unlimited pages · $19/mo
-                </Button>
-                <button
-                  onClick={() => setQuotaModal({ visible: false })}
-                  className="w-full text-gray-500 hover:text-gray-700 text-sm py-2 transition-colors"
-                >
-                  Cancel
-                </button>
-              </div>
+              {renderModalContent()}
             </motion.div>
           </motion.div>
         )}
@@ -248,9 +349,7 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
                     <p className="text-2xl font-bold text-[#1a2b48] mb-2">
                       Drop your PDF here or click to browse
                     </p>
-                    <p className="text-gray-600">
-                      Supports PDF files up to 3MB • First 3 pages free daily
-                    </p>
+                    <p className="text-gray-600">Supports PDF files up to 3MB • First 3 pages free daily</p>
                   </div>
                 </div>
               ) : (
@@ -278,13 +377,9 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
             </motion.div>
 
             {file && (
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="text-center"
-              >
+              <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="text-center">
                 <Button
-                  onClick={handleUpload}
+                  onClick={() => handleUpload()}
                   disabled={uploading}
                   className="bg-[#10b981] hover:bg-[#059669] text-white px-10 py-7 text-lg font-semibold transition-all w-full md:w-auto shadow-lg hover:shadow-xl"
                 >
