@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
 import { CONVERT_ENDPOINT, SIGNUP_ENDPOINT } from '@/config/api';
 
-const FileUpload = ({ onConversionComplete, onLimitReached }) => {
+const FileUpload = ({ onConversionComplete }) => {
   const [file, setFile]           = useState(null);
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -78,21 +78,23 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
       // Always parse JSON first — needed for quota error details
       const data = await response.json();
 
-      // Handle quota exceeded — show modal, do NOT throw
-      if (data.code === 'QUOTA_EXCEEDED') {
+      // Handle ALL quota / daily-limit responses with the inline modal.
+      // Covers: new 429 QUOTA_EXCEEDED, old 403 DAILY_LIMIT_REACHED, and
+      // any other 403/429 where the backend didn't set a specific code.
+      if (
+        data.code === 'QUOTA_EXCEEDED' ||
+        data.code === 'DAILY_LIMIT_REACHED' ||
+        response.status === 429 ||
+        response.status === 403
+      ) {
         setQuotaModal({
           visible: true,
-          type: data.requiresSignup ? 'signup' : 'upgrade',
-          message: data.error,
+          type: data.requiresUpgrade === true ? 'upgrade' : 'signup',
+          message: data.error || 'You have reached your daily conversion limit.',
           pageCount: data.pageCount,
           signupSuccess: false,
+          readyToken: null,
         });
-        return;
-      }
-
-      // Legacy 403 (IP-based limit without JSON quota detail)
-      if (response.status === 403) {
-        if (onLimitReached) onLimitReached(data);
         return;
       }
 
@@ -142,14 +144,15 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Signup failed. Please try again.');
 
-      const token = data.session?.access_token;
+      const token = data.session?.access_token || null;
       if (token) {
         localStorage.setItem('sb_access_token', token);
         setAuthToken(token);
       }
 
-      // Show "Access Unlocked" state — user clicks "Continue Converting" to retry
-      setQuotaModal(m => ({ ...m, signupSuccess: true }));
+      // Store token directly in modal state — avoids stale-closure issue where
+      // React state may not have settled before "Continue Converting" is clicked.
+      setQuotaModal(m => ({ ...m, signupSuccess: true, readyToken: token }));
     } catch (err) {
       setSignupForm(f => ({ ...f, error: err.message }));
     } finally {
@@ -158,9 +161,10 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
   };
 
   // ── Retry after signup ─────────────────────────────────────────────────────
-  // file is still in state (quota path returns early without clearing it)
-  const retryConversion = async () => {
-    const token = authToken || localStorage.getItem('sb_access_token');
+  // Reads token from quotaModal.readyToken (set at signup time, same render),
+  // falls back to localStorage. Does NOT rely on authToken state settling.
+  const retryConversion = async (readyToken) => {
+    const token = readyToken || localStorage.getItem('sb_access_token');
     setQuotaModal({ visible: false });
     setSignupForm({ email: '', password: '', loading: false, error: '' });
     await handleUpload(token);
@@ -185,7 +189,7 @@ const FileUpload = ({ onConversionComplete, onLimitReached }) => {
             Your free account is ready — you have 6 pages per day.
           </p>
           <Button
-            onClick={retryConversion}
+            onClick={() => retryConversion(quotaModal.readyToken)}
             className="w-full bg-[#0A2342] hover:bg-[#0d2e57] text-white font-semibold py-3"
           >
             <CheckCircle className="w-4 h-4 mr-2" />
