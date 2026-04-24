@@ -12,7 +12,7 @@ const FileUpload = ({ onConversionComplete }) => {
   const [pageCount, setPageCount] = useState(0);
   const [quotaModal, setQuotaModal] = useState({ visible: false });
   const [authToken, setAuthToken] = useState(null);
-  const [signupForm, setSignupForm] = useState({ email: '', password: '', loading: false, error: '' });
+  const [signupForm, setSignupForm] = useState({ firstName: '', email: '', password: '', loading: false, error: '' });
   const { toast } = useToast();
 
   const estimatePageCount = (fileSize) => Math.ceil(fileSize / (50 * 1024));
@@ -139,7 +139,7 @@ const FileUpload = ({ onConversionComplete }) => {
       const res  = await fetch(SIGNUP_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: signupForm.email, password: signupForm.password }),
+        body: JSON.stringify({ email: signupForm.email, password: signupForm.password, firstName: signupForm.firstName }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Signup failed. Please try again.');
@@ -166,13 +166,13 @@ const FileUpload = ({ onConversionComplete }) => {
   const retryConversion = async (readyToken) => {
     const token = readyToken || localStorage.getItem('sb_access_token');
     setQuotaModal({ visible: false });
-    setSignupForm({ email: '', password: '', loading: false, error: '' });
+    setSignupForm({ firstName: '', email: '', password: '', loading: false, error: '' });
     await handleUpload(token);
   };
 
   const closeModal = () => {
     setQuotaModal({ visible: false });
-    setSignupForm({ email: '', password: '', loading: false, error: '' });
+    setSignupForm({ firstName: '', email: '', password: '', loading: false, error: '' });
   };
 
   // ── Modal content ──────────────────────────────────────────────────────────
@@ -209,6 +209,14 @@ const FileUpload = ({ onConversionComplete }) => {
           <p className="text-gray-600 text-sm mb-5 leading-relaxed">{quotaModal.message}</p>
 
           <div className="flex flex-col gap-3 mb-4">
+            <input
+              type="text"
+              placeholder="First name"
+              value={signupForm.firstName}
+              onChange={e => setSignupForm(f => ({ ...f, firstName: e.target.value }))}
+              onKeyDown={e => e.key === 'Enter' && handleSignup()}
+              className="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0A2342] focus:border-transparent"
+            />
             <input
               type="email"
               placeholder="Email address"

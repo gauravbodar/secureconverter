@@ -95,7 +95,7 @@ async function handleVerifyToken(req, res) {
 // ── Supabase Auth handlers ────────────────────────────────────────────────────
 
 async function handleSupabaseSignup(req, res) {
-  const { email, password } = req.body || {};
+  const { email, password, firstName } = req.body || {};
 
   if (!isValidEmail(email))       return Errors.INVALID_EMAIL(res);
   if (!isValidPassword(password)) return Errors.WEAK_PASSWORD(res);
@@ -111,10 +111,11 @@ async function handleSupabaseSignup(req, res) {
   if (existing) return Errors.USER_EXISTS(res);
 
   const passwordHash = await bcrypt.hash(password, 10);
+  const firstNameValue = (firstName && firstName.trim()) || normEmail.split('@')[0];
 
   const { data: user, error } = await supabase
     .from('users')
-    .insert({ email: normEmail, password_hash: passwordHash, plan: 'free' })
+    .insert({ email: normEmail, first_name: firstNameValue, password_hash: passwordHash, plan: 'free' })
     .select('id, email, plan')
     .single();
 
