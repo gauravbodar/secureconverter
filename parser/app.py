@@ -53,6 +53,24 @@ def extract_header_info(pdf):
         info['bank'] = 'Unknown'
     return info
 
+def detect_bank(pdf_bytes):
+    """Best-effort bank name from first page text."""
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text = pdf.pages[0].extract_text() or ''
+        if 'Commonwealth Bank' in text or 'CommBank' in text:
+            return 'CBA'
+        if 'National Australia Bank' in text or 'NAB' in text:
+            return 'NAB'
+        if 'Westpac' in text:
+            return 'Westpac'
+        if 'ANZ' in text:
+            return 'ANZ'
+    except Exception:
+        pass
+    return 'Unknown'
+
+
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'}), 200
@@ -129,6 +147,14 @@ def parse():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+    if len(transactions) == 0:
+        return jsonify({
+            'success': False,
+            'error': 'no_transactions_found',
+            'code': 'PARSE_EMPTY',
+            'detail': 'Statement parsed but no transactions detected.',
+        }), 422
+
     sum_credits = round(sum(t['credit'] or 0 for t in transactions), 2)
     sum_debits  = round(sum(t['debit']  or 0 for t in transactions), 2)
     ob = header_info.get('openingBalance') or 0
@@ -137,11 +163,14 @@ def parse():
     balance_valid = abs(computed_close - cb) < 0.05
 
     return jsonify({
+        'success':       True,
         'bank':          header_info.get('bank'),
+        'bankCode':      detect_bank(pdf_bytes),
         'accountName':   header_info.get('accountName'),
         'accountNumber': header_info.get('accountNumber'),
         'bsb':           header_info.get('bsb'),
         'pageCount':     page_count_val,
+        'rowCount':      len(transactions),
         'statementPeriod': {
             'from': header_info.get('periodFrom'),
             'to':   header_info.get('periodTo'),

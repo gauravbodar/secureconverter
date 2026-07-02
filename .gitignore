@@ -1,1 +1,5 @@
 node_modules
+parser/tests/fixtures/2026-04-28.pdf
+parser/tests/fixtures/cba_transaction_summary.pdf
+parser/tests/fixtures/cba_your_statement.pdf
+parser/tests/fixtures/nab_business.pdf

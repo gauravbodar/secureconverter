@@ -1,0 +1,43 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.6.0 -- C:\Users\User\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\python.exe
+cachedir: .pytest_cache
+rootdir: C:\AWS\securestatement\parser
+plugins: anyio-4.13.0
+collecting ... collected 34 items
+
+tests/test_universal.py::TestCBATransactionSummary::test_contract PASSED [  2%]
+tests/test_universal.py::TestCBATransactionSummary::test_document_year PASSED [  5%]
+tests/test_universal.py::TestCBATransactionSummary::test_row_count PASSED [  8%]
+tests/test_universal.py::TestCBATransactionSummary::test_all_dates_correct_year PASSED [ 11%]
+tests/test_universal.py::TestCBATransactionSummary::test_first_transaction PASSED [ 14%]
+tests/test_universal.py::TestCBATransactionSummary::test_last_transaction PASSED [ 17%]
+tests/test_universal.py::TestCBATransactionSummary::test_debit_rows_present PASSED [ 20%]
+tests/test_universal.py::TestCBATransactionSummary::test_credit_rows_present PASSED [ 23%]
+tests/test_universal.py::TestCBATransactionSummary::test_no_footer_bleed PASSED [ 26%]
+tests/test_universal.py::TestCBATransactionSummary::test_no_dot_artifacts PASSED [ 29%]
+tests/test_universal.py::TestCBATransactionSummary::test_balance_chain PASSED [ 32%]
+tests/test_universal.py::TestCBATransactionSummary::test_csv_shape PASSED [ 35%]
+tests/test_universal.py::TestCBAYourStatement::test_contract PASSED      [ 38%]
+tests/test_universal.py::TestCBAYourStatement::test_document_year PASSED [ 41%]
+tests/test_universal.py::TestCBAYourStatement::test_row_count PASSED     [ 44%]
+tests/test_universal.py::TestCBAYourStatement::test_all_dates_correct_year PASSED [ 47%]
+tests/test_universal.py::TestCBAYourStatement::test_no_2307_year PASSED  [ 50%]
+tests/test_universal.py::TestCBAYourStatement::test_opening_balance_not_a_transaction PASSED [ 52%]
+tests/test_universal.py::TestCBAYourStatement::test_closing_balance_approximately_correct PASSED [ 55%]
+tests/test_universal.py::TestCBAYourStatement::test_no_barcode_artifacts PASSED [ 58%]
+tests/test_universal.py::TestCBAYourStatement::test_no_value_date_in_description PASSED [ 61%]
+tests/test_universal.py::TestCBAYourStatement::test_debit_and_credit_separate PASSED [ 64%]
+tests/test_universal.py::TestCBAYourStatement::test_amounts_never_both_set PASSED [ 67%]
+tests/test_universal.py::TestNABBusiness::test_contract PASSED           [ 70%]
+tests/test_universal.py::TestNABBusiness::test_document_year PASSED      [ 73%]
+tests/test_universal.py::TestNABBusiness::test_row_count PASSED          [ 76%]
+tests/test_universal.py::TestNABBusiness::test_all_dates_correct_year PASSED [ 79%]
+tests/test_universal.py::TestNABBusiness::test_no_brought_carried_forward PASSED [ 82%]
+tests/test_universal.py::TestNABBusiness::test_no_important_notice PASSED [ 85%]
+tests/test_universal.py::TestNABBusiness::test_no_dot_artifacts PASSED   [ 88%]
+tests/test_universal.py::TestNABBusiness::test_gaurav_bodar_credit_present PASSED [ 91%]
+tests/test_universal.py::TestNABBusiness::test_debit_and_credit_separate PASSED [ 94%]
+tests/test_universal.py::TestNABBusiness::test_amounts_never_both_set PASSED [ 97%]
+tests/test_universal.py::TestNABBusiness::test_no_transaction_fee_summary PASSED [100%]
+
+============================= 34 passed in 30.67s =============================

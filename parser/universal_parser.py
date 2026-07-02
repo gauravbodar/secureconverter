@@ -55,6 +55,10 @@ MONTH_MAP = {
 # ── Dots-only text (NAB visual separator artifact) ──────────────────────────
 DOTS_RE = re.compile(r'^[.\s]+$')
 
+# ── NAB "TRANSACTION SUMMARY" fee-breakdown block (bounded, non-transactional) ──
+FEE_TABLE_START_RE = re.compile(r'TRANSACTION\s+SUMMARY\s+QUANTITY', re.IGNORECASE)
+FEE_TABLE_END_RE   = re.compile(r'Total\s+Fees\s+Charged', re.IGNORECASE)
+
 
 def detect_columns(page_words):
     """
@@ -275,21 +279,34 @@ def is_transaction_open_row(row_words, columns):
     return has_day and has_month
 
 
-def extract_date_from_row(row_words, columns):
+def extract_date_from_row(row_words, columns, fallback_year=None):
     """Pull date column words and parse them."""
-    date_texts = [w['text'] for w in row_words
+    date_words = [w for w in row_words
                   if classify_word(w, columns) == 'date']
-    return parse_date(date_texts)
+    date_texts = [w['text'] for w in date_words]
+    return parse_date(date_texts, fallback_year=fallback_year)
 
 
 def extract_description_from_row(row_words, columns):
-    """Join description column words, skip dot-only artifacts."""
+    """Join description column words, skip dot-leader artifacts."""
     words = sorted(
         (w for w in row_words if classify_word(w, columns) == 'description'),
         key=lambda w: w['x0']
     )
-    parts = [w['text'] for w in words if not DOTS_RE.match(w['text'])]
-    return ' '.join(parts)
+    parts = []
+    for w in words:
+        if DOTS_RE.match(w['text']):
+            continue
+        # Dot-leaders are often fused directly onto a word with no
+        # whitespace (e.g. "Canberra.............."), not their own token.
+        cleaned = re.sub(r'\.{3,}', '', w['text']).strip()
+        if cleaned:
+            parts.append(cleaned)
+    text = ' '.join(parts)
+    # Remove "Value Date: DD/MM/YYYY" — it is card-transaction metadata,
+    # not part of the merchant description
+    text = re.sub(r'\s*Value\s+Date:\s*\d{2}/\d{2}/\d{4}', '', text).strip()
+    return text
 
 
 def extract_amount_from_row(row_words, columns):
@@ -340,6 +357,44 @@ def extract_balance_from_row(row_words, columns):
     return parse_balance(bal_text, suffix_w)
 
 
+# Matches full 4-digit years in date context (never store numbers like 2307)
+_YEAR_CONTEXT_RE = re.compile(
+    r'(?:'
+    r'Statement\s+(?:Period|starts|ends|date)[^\d]*?(20\d{2})'   # NAB / CBA header
+    r'|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*'
+        r'\s+(?:\d{1,2}\s+)?(20\d{2})'                           # "30 Jun 2022"
+    r'|(20\d{2})\s+(?:OPENING|Opening)'                           # "2025 OPENING BALANCE"
+    r')',
+    re.IGNORECASE
+)
+
+def extract_document_year(pdf_bytes):
+    """
+    Pre-scan the first two pages to find the statement year from
+    the document header — before any transaction processing.
+
+    Why pre-scan: CBA "Your Statement" never puts a standalone year
+    in the date column. The only reliable year source is the statement
+    period line in the page header (e.g. "1 Jul 2025 - 30 Sep 2025").
+
+    Returns int year or None.
+    """
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages[:2]:
+                text = page.extract_text() or ''
+                for m in _YEAR_CONTEXT_RE.finditer(text):
+                    # Return first matched group that is not None
+                    for group in m.groups():
+                        if group:
+                            year = int(group)
+                            if 2000 <= year <= 2050:
+                                return year
+    except Exception:
+        pass
+    return None
+
+
 def parse_pdf(pdf_bytes):
     """
     Main entry point. Accepts raw PDF bytes, returns list of transaction dicts:
@@ -350,7 +405,8 @@ def parse_pdf(pdf_bytes):
     current_tx   = None
     current_date = None
     # Track year from full dates (e.g., NAB shows "1 Jun 2022")
-    current_year = datetime.now().year
+    doc_year     = extract_document_year(pdf_bytes)
+    current_year = doc_year if doc_year else datetime.now().year
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -369,11 +425,36 @@ def parse_pdf(pdf_bytes):
                 and w['x0'] >= 14
             ]
 
+            # NAB pages may contain a bounded fee-breakdown sub-table
+            # (TRANSACTION SUMMARY ... Total Fees Charged) — not transactions.
+            in_fee_table = False
+
             for _, row_words in group_words_by_row(tx_words):
                 # Ignore rows with no words in any column
                 classified = [w for w in row_words
                               if classify_word(w, columns) is not None]
                 if not classified:
+                    continue
+
+                row_text_all = ' '.join(w['text'] for w in row_words)
+
+                if in_fee_table:
+                    if FEE_TABLE_END_RE.search(row_text_all):
+                        in_fee_table = False
+                    continue
+
+                if FEE_TABLE_START_RE.search(row_text_all):
+                    # Capture the date before discarding this row — real
+                    # transactions often resume later on the same page.
+                    date_str = extract_date_from_row(row_words, columns,
+                                                      fallback_year=current_year)
+                    if date_str:
+                        current_date = date_str
+                        try:
+                            current_year = int(date_str[:4])
+                        except (ValueError, TypeError):
+                            pass
+                    in_fee_table = True
                     continue
 
                 if should_skip_row(row_words, columns):
@@ -382,6 +463,24 @@ def parse_pdf(pdf_bytes):
                 # ── Does this row open a new transaction? ──────────────────
                 opens_new = is_transaction_open_row(row_words, columns)
 
+                if not opens_new and current_tx is not None:
+                    already_complete = (current_tx['debit'] is not None or
+                                         current_tx['credit'] is not None)
+                    if already_complete:
+                        row_debit, row_credit = extract_amount_from_row(row_words, columns)
+                        has_row_amount = row_debit is not None or row_credit is not None
+                        # CBA's "Value Date: DD/MM/YYYY" line is the one known
+                        # legitimate trailing continuation of an already-complete
+                        # transaction; it never carries its own amount.
+                        is_trailing_metadata = 'Value Date:' in row_text_all
+                        if has_row_amount or not is_trailing_metadata:
+                            # current_tx already has its amount — this row is a
+                            # separate same-day transaction that doesn't repeat
+                            # the date column (NAB layout), or the first line of
+                            # one wrapped across multiple lines. Either way it
+                            # isn't more continuation text for current_tx.
+                            opens_new = True
+
                 if opens_new:
                     # Save previous
                     if current_tx and (current_tx['debit'] or
@@ -389,7 +488,8 @@ def parse_pdf(pdf_bytes):
                                        current_tx['balance']):
                         transactions.append(_finalise(current_tx))
 
-                    date_str = extract_date_from_row(row_words, columns)
+                    date_str = extract_date_from_row(row_words, columns,
+                                                      fallback_year=current_year)
                     if date_str:
                         current_date = date_str
                         # Extract year for fallback
@@ -454,18 +554,18 @@ def parse_pdf(pdf_bytes):
 
 
 def _finalise(tx):
-    """Convert internal transaction dict to output schema."""
-    def fmt(v):
+    """Convert internal transaction dict to output schema (float | None amounts)."""
+    def to_amount(v):
         if v is None:
-            return ''
-        return f'{v:.2f}'
+            return None
+        return round(float(v), 2)
 
     return {
         'date':        tx.get('date', ''),
         'description': tx.get('description', '').strip(),
-        'debit':       fmt(tx.get('debit')),
-        'credit':      fmt(tx.get('credit')),
-        'balance':     fmt(tx.get('balance')),
+        'debit':       to_amount(tx.get('debit')),
+        'credit':      to_amount(tx.get('credit')),
+        'balance':     to_amount(tx.get('balance')),
     }
 
 
@@ -479,5 +579,16 @@ def parse_to_csv(pdf_bytes):
         lineterminator='\r\n'
     )
     writer.writeheader()
-    writer.writerows(transactions)
+
+    def fmt(v):
+        return '' if v is None else f'{v:.2f}'
+
+    for t in transactions:
+        writer.writerow({
+            'date':        t['date'],
+            'description': t['description'],
+            'debit':       fmt(t['debit']),
+            'credit':      fmt(t['credit']),
+            'balance':     fmt(t['balance']),
+        })
     return out.getvalue()
