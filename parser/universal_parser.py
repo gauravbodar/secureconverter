@@ -37,7 +37,7 @@ ALL_HEADER_WORDS = {alias for aliases in COLUMN_ALIASES.values() for alias in al
 SKIP_FIRST_WORDS = {
     'Brought', 'Carried', 'Important', 'TRANSACTION', 'Explanatory',
     'Summary', 'Please', 'Identifying', 'Government', 'From', 'Last',
-    'Note:', 'Name:', 'The',
+    'Note:', 'Name:',
 }
 SKIP_EXACT = {
     'OPENING BALANCE', 'CLOSING BALANCE', '2025 OPENING BALANCE',
@@ -58,6 +58,16 @@ DOTS_RE = re.compile(r'^[.\s]+$')
 # ── NAB "TRANSACTION SUMMARY" fee-breakdown block (bounded, non-transactional) ──
 FEE_TABLE_START_RE = re.compile(r'TRANSACTION\s+SUMMARY\s+QUANTITY', re.IGNORECASE)
 FEE_TABLE_END_RE   = re.compile(r'Total\s+Fees\s+Charged', re.IGNORECASE)
+
+# ── CBA "Your Statement" closing reconciliation block ───────────────────────
+# A two-row footer: a label line, then the four values on their own row
+# (e.g. "$4,190.82 CR $162,372.07 $159,711.99 $1,530.74 CR"). Neither row is
+# a transaction; the values row has no date and would otherwise misclassify
+# into debit/credit/balance zones by raw x-position.
+CLOSING_SUMMARY_LABEL_RE = re.compile(
+    r'Opening\s+balance\s*-\s*Total\s+debits\s*\+\s*Total\s+credits\s*=\s*Closing\s+balance',
+    re.IGNORECASE
+)
 
 
 def detect_columns(page_words):
@@ -428,6 +438,10 @@ def parse_pdf(pdf_bytes):
             # NAB pages may contain a bounded fee-breakdown sub-table
             # (TRANSACTION SUMMARY ... Total Fees Charged) — not transactions.
             in_fee_table = False
+            # CBA "Your Statement" closing reconciliation block: the label
+            # row is matched by content, then its values row (no date, no
+            # reliable column alignment) is skipped unconditionally.
+            skip_next_row = False
 
             for _, row_words in group_words_by_row(tx_words):
                 # Ignore rows with no words in any column
@@ -437,6 +451,14 @@ def parse_pdf(pdf_bytes):
                     continue
 
                 row_text_all = ' '.join(w['text'] for w in row_words)
+
+                if skip_next_row:
+                    skip_next_row = False
+                    continue
+
+                if CLOSING_SUMMARY_LABEL_RE.search(row_text_all):
+                    skip_next_row = True
+                    continue
 
                 if in_fee_table:
                     if FEE_TABLE_END_RE.search(row_text_all):
@@ -463,23 +485,33 @@ def parse_pdf(pdf_bytes):
                 # ── Does this row open a new transaction? ──────────────────
                 opens_new = is_transaction_open_row(row_words, columns)
 
-                if not opens_new and current_tx is not None:
-                    already_complete = (current_tx['debit'] is not None or
-                                         current_tx['credit'] is not None)
-                    if already_complete:
-                        row_debit, row_credit = extract_amount_from_row(row_words, columns)
-                        has_row_amount = row_debit is not None or row_credit is not None
-                        # CBA's "Value Date: DD/MM/YYYY" line is the one known
-                        # legitimate trailing continuation of an already-complete
-                        # transaction; it never carries its own amount.
-                        is_trailing_metadata = 'Value Date:' in row_text_all
-                        if has_row_amount or not is_trailing_metadata:
-                            # current_tx already has its amount — this row is a
-                            # separate same-day transaction that doesn't repeat
-                            # the date column (NAB layout), or the first line of
-                            # one wrapped across multiple lines. Either way it
-                            # isn't more continuation text for current_tx.
-                            opens_new = True
+                if not opens_new:
+                    if current_tx is not None:
+                        already_complete = (current_tx['debit'] is not None or
+                                             current_tx['credit'] is not None)
+                        if already_complete:
+                            row_debit, row_credit = extract_amount_from_row(row_words, columns)
+                            has_row_amount = row_debit is not None or row_credit is not None
+                            # CBA's "Value Date: DD/MM/YYYY" line is the one known
+                            # legitimate trailing continuation of an already-complete
+                            # transaction; it never carries its own amount.
+                            is_trailing_metadata = 'Value Date:' in row_text_all
+                            if has_row_amount or not is_trailing_metadata:
+                                # current_tx already has its amount — this row is a
+                                # separate same-day transaction that doesn't repeat
+                                # the date column (NAB layout), or the first line of
+                                # one wrapped across multiple lines. Either way it
+                                # isn't more continuation text for current_tx.
+                                opens_new = True
+                    elif current_date is not None:
+                        # current_tx was cleared at a page boundary (flushed at
+                        # the previous page's end-of-page, or discarded after a
+                        # "Brought forward" marker was skipped) but we're still
+                        # mid-statement — a date has already been seen. NAB
+                        # resumes same-day transactions across the break without
+                        # repeating the date, so this dateless row is a genuine
+                        # transaction continuing onto the new page, not noise.
+                        opens_new = True
 
                 if opens_new:
                     # Save previous
@@ -560,12 +592,19 @@ def _finalise(tx):
             return None
         return round(float(v), 2)
 
+    balance = to_amount(tx.get('balance'))
+    if balance is not None and tx.get('overdraft'):
+        # DR (overdraft) balances are parsed as a positive magnitude plus a
+        # separate overdraft flag — apply the sign here, the one place that
+        # converts to the final output schema.
+        balance = -balance
+
     return {
         'date':        tx.get('date', ''),
         'description': tx.get('description', '').strip(),
         'debit':       to_amount(tx.get('debit')),
         'credit':      to_amount(tx.get('credit')),
-        'balance':     to_amount(tx.get('balance')),
+        'balance':     balance,
     }
 
 
