@@ -28,6 +28,12 @@ function getClientIP(req) {
  * Increments quota by pageCount if allowed.
  */
 async function checkQuota(req, pageCount) {
+  // Beta accommodation: bypasses quota entirely when enabled. Reversible by
+  // unsetting the env var — no quota/Stripe logic below is touched or removed.
+  if (process.env.BETA_UNLIMITED_MODE === 'true') {
+    return { allowed: true, plan: 'beta-unlimited' };
+  }
+
   const supabase = getSupabase();
   const today = new Date().toISOString().slice(0, 10);
   const authHeader = req.headers.authorization;
