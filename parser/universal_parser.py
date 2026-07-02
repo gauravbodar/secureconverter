@@ -442,6 +442,11 @@ def parse_pdf(pdf_bytes):
             # row is matched by content, then its values row (no date, no
             # reliable column alignment) is skipped unconditionally.
             skip_next_row = False
+            # NAB pages may open with a multi-line "Important" compliance/
+            # insurance notice, whose continuation lines don't start with a
+            # skip-word themselves — bracket it until real transaction
+            # content (a row with its own amount or its own date) resumes.
+            in_notice_block = False
 
             for _, row_words in group_words_by_row(tx_words):
                 # Ignore rows with no words in any column
@@ -479,7 +484,34 @@ def parse_pdf(pdf_bytes):
                     in_fee_table = True
                     continue
 
+                if in_notice_block:
+                    # Resume once a row looks like real transaction content
+                    # again — disclaimer prose never carries a dollar amount.
+                    notice_debit, notice_credit = extract_amount_from_row(row_words, columns)
+                    if (notice_debit is None and notice_credit is None
+                            and not is_transaction_open_row(row_words, columns)):
+                        continue
+                    in_notice_block = False
+
                 if should_skip_row(row_words, columns):
+                    # Even a skipped row (e.g. "Brought forward") may carry
+                    # the day's date prefix — capture it so subsequent
+                    # same-day transactions that don't repeat the date
+                    # don't lose their only anchor to it.
+                    date_str = extract_date_from_row(row_words, columns,
+                                                      fallback_year=current_year)
+                    if date_str:
+                        current_date = date_str
+                        try:
+                            current_year = int(date_str[:4])
+                        except (ValueError, TypeError):
+                            pass
+
+                    desc_words = [w for w in row_words
+                                  if classify_word(w, columns) == 'description']
+                    first_word = desc_words[0]['text'] if desc_words else ''
+                    if first_word == 'Important':
+                        in_notice_block = True
                     continue
 
                 # ── Does this row open a new transaction? ──────────────────

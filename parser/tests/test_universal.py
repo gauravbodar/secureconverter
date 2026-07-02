@@ -4,7 +4,9 @@ Run from parser/ directory: python3 -m pytest tests/test_universal.py -v
 """
 import pytest, csv, io, sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+import pdfplumber
 from universal_parser import parse_pdf, parse_to_csv, extract_document_year
+from app import compute_balance_valid, extract_header_info
 
 FIXTURES = {
     'cba_summary':      'tests/fixtures/cba_transaction_summary.pdf',
@@ -224,12 +226,61 @@ class TestNABBusiness:
         assert extract_document_year(self.pdf) == 2022
 
     def test_row_count(self):
-        assert len(self.txns) >= 40, \
-            f"Expected 40+, got {len(self.txns)}"
+        # Exact, not >=: this fixture previously passed at 101 rows while
+        # silently missing 9 transactions (a "Brought forward"+"Important"
+        # notice sequence on page 0 losing the day's date entirely) — a
+        # >= check can't catch a shortfall that still clears the bar.
+        assert len(self.txns) == 110, \
+            f"Expected exactly 110, got {len(self.txns)}"
 
     def test_all_dates_correct_year(self):
         years = {t['date'][:4] for t in self.txns if t['date']}
         assert years == {'2022'}, f"Wrong years: {years}"
+
+    def test_total_debits_and_credits(self):
+        sum_debits  = round(sum(t['debit']  or 0 for t in self.txns), 2)
+        sum_credits = round(sum(t['credit'] or 0 for t in self.txns), 2)
+        assert abs(sum_debits  - 25467.81) < 0.02, f"sum debits {sum_debits}"
+        assert abs(sum_credits - 25568.19) < 0.02, f"sum credits {sum_credits}"
+
+    def test_balance_chain_reconciles_to_closing_balance(self):
+        closing = assert_balance_chain(self.txns, opening_balance=-12204.06,
+                                        label='NAB-Business')
+        assert abs(closing - (-12103.68)) < 0.02, \
+            f"Final balance {closing}, expected -12103.68 (12,103.68 Dr)"
+
+    def test_previously_dropped_1_jun_transactions_present(self):
+        # (description substring, amount, debit-or-credit) for the 9
+        # transactions dropped by the "Brought forward" + "Important"
+        # notice sequence on page 0 — both carry 1 Jun 2022's date, both
+        # get correctly skip-filtered as noise, but the date used to be
+        # discarded along with them, leaving nothing for these dateless
+        # rows (NAB doesn't repeat the date on every same-day row) to
+        # anchor to.
+        expected = [
+            ('Springbank Rise 166111',        590.00, 'credit'),
+            ('Online B3658037334',            300.00, 'debit'),
+            ('Tyro Fees',                      276.25, 'debit'),
+            ('Woolwort',                         6.07, 'debit'),
+            ('Aldi STO Res - Casey',            30.21, 'debit'),
+            ('Boost Ju',                        30.80, 'debit'),
+            ('7-ELEVEN',                        60.47, 'debit'),
+            ('Big W',                          129.40, 'debit'),
+            # "Coff ee Galleria" (space) — pdfplumber's own tokenization of
+            # this source line, same class of artifact as nab_page_break's
+            # "Raz*aksh ardham", not something this fix touches.
+            ('Coff ee Galleria',               303.80, 'debit'),
+        ]
+        for substr, amount, kind in expected:
+            matches = [
+                t for t in self.txns
+                if substr.lower() in t['description'].lower()
+                and t['date'] == '2022-06-01'
+                and t[kind] is not None and abs(t[kind] - amount) < 0.01
+            ]
+            assert len(matches) == 1, \
+                f"Expected exactly one 2022-06-01 {kind} matching '{substr}' / {amount}, " \
+                f"found {len(matches)}"
 
     def test_no_brought_carried_forward(self):
         for t in self.txns:
@@ -432,3 +483,147 @@ class TestCBADRExcursion:
                 if t['debit'] is not None and t['credit'] is not None]
         assert len(both) == 0, \
             f"{len(both)} rows have both debit and credit set"
+
+
+# ── Balance reconciliation formula (parser/app.py's compute_balance_valid) ──
+# Regression coverage for the ob + debits - credits sign-flip bug: a debit
+# decreases the running balance, a credit increases it, so the correct
+# formula is ob - debits + credits. The danger of the old formula is that it
+# can silently self-cancel and report a false "verified" result specifically
+# when total debits and total credits happen to be close in value — passing
+# on some real statements and failing on others depending on the shape of
+# the data, not the correctness of the parse. That's what let it ship.
+
+class TestBalanceReconciliationFormula:
+
+    def test_sign_cancellation_false_positive_synthetic(self):
+        """
+        Deliberately synthetic numbers — not derived from any PDF, not a
+        fabricated PDF file — chosen so debits and credits are far apart
+        ($10,000 vs $500, matching the task's own example). This is exactly
+        the shape of data that makes the OLD buggy formula visibly wrong
+        rather than coincidentally correct, which is why it's the primary
+        regression guard here rather than a real fixture (none of our real
+        fixtures have a gap this dramatic).
+        """
+        opening_balance = 1000.00
+        sum_debits      = 10000.00
+        sum_credits     = 500.00
+        closing_balance = round(opening_balance - sum_debits + sum_credits, 2)  # -8500.00
+
+        computed_close, is_valid = compute_balance_valid(
+            opening_balance, sum_debits, sum_credits, closing_balance
+        )
+        assert is_valid, \
+            f"Correct formula should reconcile: computed={computed_close}, expected={closing_balance}"
+
+        # Demonstrate why this shape matters: the OLD buggy formula
+        # (ob + debits - credits) is off by 2*(debits-credits) here — nowhere
+        # near a coincidental pass, unlike the debits≈credits case that let
+        # this bug ship unnoticed.
+        old_buggy_close = round(opening_balance + sum_debits - sum_credits, 2)
+        assert abs(old_buggy_close - closing_balance) > 100, \
+            "This synthetic case should make the old buggy formula visibly wrong"
+
+    def test_correct_formula_against_real_fixture(self):
+        """
+        Cross-check against cba_dr_excursion.pdf — the exact fixture this
+        bug was originally found against — using extract_header_info()'s
+        actual output end-to-end, now that its case-sensitivity /
+        page-0-only bug is fixed (see TestHeaderBalanceExtraction). This
+        used to hardcode the ground-truth opening/closing balance because
+        extraction returned None for both; that workaround is gone now
+        that extraction genuinely produces the same values independently.
+
+        This fixture's debit/credit gap ($162,372.07 vs $159,711.99, ~1.6%
+        apart) is real, not engineered to be as dramatic as the synthetic
+        case above — it's actually close to the exact "debits≈credits"
+        shape that let the original bug go unnoticed, which makes it a
+        meaningful real-data companion to the synthetic case rather than a
+        replacement for it.
+        """
+        pdf_bytes = load('cba_dr_excursion')
+        txns = parse_pdf(pdf_bytes)
+        sum_debits  = round(sum(t['debit']  or 0 for t in txns), 2)
+        sum_credits = round(sum(t['credit'] or 0 for t in txns), 2)
+
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            header_info = extract_header_info(pdf)
+        opening_balance = header_info['openingBalance']
+        closing_balance = header_info['closingBalance']
+        assert opening_balance is not None and closing_balance is not None, \
+            "extract_header_info() should no longer return None for this fixture"
+
+        computed_close, is_valid = compute_balance_valid(
+            opening_balance, sum_debits, sum_credits, closing_balance
+        )
+        assert is_valid, \
+            f"Correct formula should reconcile real fixture: computed={computed_close}, " \
+            f"expected={closing_balance}"
+
+        old_buggy_close = round(opening_balance + sum_debits - sum_credits, 2)
+        assert abs(old_buggy_close - closing_balance) > 0.05, \
+            "Old buggy formula should also fail on this real fixture (documenting, not " \
+            "just assuming, that this specific case wasn't a coincidental pass either)"
+
+
+# ── extract_header_info()'s balance/credit/debit fields, across every ───────
+# statement format in the fixture set. Regression coverage for the
+# case-sensitive, page-0-only regex bug that made these fields silently
+# None for CBA "Your Statement" files (and would have made the sign-fix
+# from the previous task ineffective in the live API for that bank).
+
+class TestHeaderBalanceExtraction:
+
+    def _extract(self, key):
+        with pdfplumber.open(io.BytesIO(load(key))) as pdf:
+            return extract_header_info(pdf)
+
+    def test_cba_dr_excursion_extracted(self):
+        info = self._extract('cba_dr_excursion')
+        assert info['openingBalance'] is not None
+        assert info['closingBalance'] is not None
+        assert abs(info['openingBalance'] - 4190.82)   < 0.01
+        assert abs(info['closingBalance'] - 1530.74)   < 0.01
+        assert abs(info['totalCredits']   - 159711.99) < 0.01
+        assert abs(info['totalDebits']    - 162372.07) < 0.01
+
+    def test_nab_business_extracted(self):
+        info = self._extract('nab_business')
+        assert info['openingBalance'] is not None
+        assert info['closingBalance'] is not None
+        # NAB is chronically in overdraft (Dr) throughout — must be negative.
+        assert info['openingBalance'] < 0, "Dr opening balance must be negative"
+        assert info['closingBalance'] < 0, "Dr closing balance must be negative"
+        assert abs(info['openingBalance'] - (-12204.06)) < 0.01
+        assert abs(info['closingBalance'] - (-12103.68)) < 0.01
+        assert abs(info['totalCredits']   - 25568.19)    < 0.01
+        assert abs(info['totalDebits']    - 25467.81)    < 0.01
+
+    def test_nab_page_break_extracted(self):
+        info = self._extract('nab_page_break')
+        assert info['openingBalance'] is not None
+        assert info['closingBalance'] is not None
+        assert info['openingBalance'] < 0, "Dr opening balance must be negative"
+        assert info['closingBalance'] < 0, "Dr closing balance must be negative"
+        assert abs(info['openingBalance'] - (-10620.57)) < 0.01
+        assert abs(info['closingBalance'] - (-1343.96))  < 0.01
+        assert abs(info['totalCredits']   - 30762.48)    < 0.01
+        assert abs(info['totalDebits']    - 21485.87)    < 0.01
+
+    def test_cba_transaction_summary_has_no_header_balance_data(self):
+        """
+        Not a bug: this statement format is a plain transaction letter
+        that never prints opening/closing balance or total credit/debit
+        figures anywhere in the document — confirmed by inspecting the
+        full extracted text of every page. None is the correct, honest
+        result here, not something to force a value for by inventing a
+        source (e.g. deriving it from the first/last transaction's own
+        balance) that this task didn't ask for and that would conflate
+        header extraction with transaction-derived data.
+        """
+        info = self._extract('cba_summary')
+        assert info['openingBalance'] is None
+        assert info['closingBalance'] is None
+        assert info['totalCredits']   is None
+        assert info['totalDebits']    is None

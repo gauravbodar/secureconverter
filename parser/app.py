@@ -19,18 +19,65 @@ def parse_amount(val):
     return abs(value) if value is not None else None
 
 
+def _signed_balance(magnitude_str, suffix):
+    """Apply Dr/overdraft sign to a header-extracted balance magnitude."""
+    value = parse_amount(magnitude_str)
+    if value is None:
+        return None
+    if suffix and suffix.strip().upper() == 'DR':
+        return -value
+    return value
+
+
+# Some statement formats (e.g. CBA "Your Statement") never print a
+# standalone "Opening balance $X" header line — the only place all four
+# figures appear together is a closing reconciliation block, usually on the
+# last page: a label line followed by a values line in the same order.
+# Matched against the full document text with newlines flattened to spaces,
+# since the label and values sit on two separate physical lines.
+_RECONCILIATION_RE = re.compile(
+    r'Opening\s+balance\s*-\s*Total\s+debits\s*\+\s*Total\s+credits\s*=\s*Closing\s+balance'
+    r'\s*\$?([\d,]+\.?\d*)\s*(CR|DR)?\s+'
+    r'\$?([\d,]+\.?\d*)\s+'
+    r'\$?([\d,]+\.?\d*)\s+'
+    r'\$?([\d,]+\.?\d*)\s*(CR|DR)?',
+    re.IGNORECASE
+)
+
+
 def extract_header_info(pdf):
-    """Extract account metadata from first page."""
+    """Extract account metadata. Balance/credit/debit fields are searched
+    case-insensitively across the whole document, since some formats only
+    print them on a page other than the first (e.g. a closing summary)."""
     text = pdf.pages[0].extract_text() or ''
+    full_text = '\n'.join((page.extract_text() or '') for page in pdf.pages)
     info = {}
-    ob = re.search(r'Opening balance\s+\$?([\d,]+\.?\d*)', text)
-    cb = re.search(r'Closing balance\s+\$?([\d,]+\.?\d*)', text)
-    tc = re.search(r'Total credits\s+\$?([\d,]+\.?\d*)', text)
-    td = re.search(r'Total debits\s+\$?([\d,]+\.?\d*)', text)
-    info['openingBalance'] = parse_amount(ob.group(1)) if ob else None
-    info['closingBalance'] = parse_amount(cb.group(1)) if cb else None
+
+    ob = re.search(r'Opening\s+balance\s+\$?([\d,]+\.?\d*)\s*(CR|DR)?', full_text, re.IGNORECASE)
+    cb = re.search(r'Closing\s+balance\s+\$?([\d,]+\.?\d*)\s*(CR|DR)?', full_text, re.IGNORECASE)
+    tc = re.search(r'Total\s+credits\s+\$?([\d,]+\.?\d*)', full_text, re.IGNORECASE)
+    td = re.search(r'Total\s+debits\s+\$?([\d,]+\.?\d*)', full_text, re.IGNORECASE)
+
+    info['openingBalance'] = _signed_balance(ob.group(1), ob.group(2)) if ob else None
+    info['closingBalance'] = _signed_balance(cb.group(1), cb.group(2)) if cb else None
     info['totalCredits']   = parse_amount(tc.group(1)) if tc else None
     info['totalDebits']    = parse_amount(td.group(1)) if td else None
+
+    # Fall back to the reconciliation block for whichever fields the simple
+    # single-line patterns didn't find (never overrides a value already found).
+    if None in (info['openingBalance'], info['closingBalance'],
+                info['totalCredits'], info['totalDebits']):
+        rec = _RECONCILIATION_RE.search(full_text.replace('\n', ' '))
+        if rec:
+            if info['openingBalance'] is None:
+                info['openingBalance'] = _signed_balance(rec.group(1), rec.group(2))
+            if info['totalDebits'] is None:
+                info['totalDebits'] = parse_amount(rec.group(3))
+            if info['totalCredits'] is None:
+                info['totalCredits'] = parse_amount(rec.group(4))
+            if info['closingBalance'] is None:
+                info['closingBalance'] = _signed_balance(rec.group(5), rec.group(6))
+
     bsb = re.search(r'BSB\s+(?:number\s+)?([\d-]+)', text)
     acc = re.search(r'Account\s+number\s+([\d-]+)', text)
     info['bsb'] = bsb.group(1) if bsb else ''
@@ -52,6 +99,18 @@ def extract_header_info(pdf):
     else:
         info['bank'] = 'Unknown'
     return info
+
+def compute_balance_valid(opening_balance, sum_debits, sum_credits, closing_balance, tolerance=0.05):
+    """
+    Reconcile a statement's closing balance from its opening balance and
+    transaction sums. A debit decreases the running balance, a credit
+    increases it. Returns (computed_closing_balance, is_valid).
+    """
+    ob = opening_balance or 0
+    cb = closing_balance or 0
+    computed_close = round(ob - sum_debits + sum_credits, 2)
+    return computed_close, abs(computed_close - cb) < tolerance
+
 
 def detect_bank(pdf_bytes):
     """Best-effort bank name from first page text."""
@@ -157,10 +216,10 @@ def parse():
 
     sum_credits = round(sum(t['credit'] or 0 for t in transactions), 2)
     sum_debits  = round(sum(t['debit']  or 0 for t in transactions), 2)
-    ob = header_info.get('openingBalance') or 0
-    cb = header_info.get('closingBalance') or 0
-    computed_close = round(ob + sum_debits - sum_credits, 2)
-    balance_valid = abs(computed_close - cb) < 0.05
+    _, balance_valid = compute_balance_valid(
+        header_info.get('openingBalance'), sum_debits, sum_credits,
+        header_info.get('closingBalance')
+    )
 
     return jsonify({
         'success':       True,

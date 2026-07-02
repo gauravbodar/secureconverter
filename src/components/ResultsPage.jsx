@@ -4,6 +4,12 @@ import { Download, CheckCircle, ArrowLeft, ExternalLink, AlertCircle } from 'luc
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
 
+// Affiliate/partner links for the "What's Next?" promotion cards.
+// Edit the value below directly — no other code changes needed.
+const PROMO_LINKS = {
+  myob: 'PLACEHOLDER_MYOB_AFFILIATE_LINK',
+};
+
 function buildCSV(transactions) {
   const rows = [['date', 'description', 'debit', 'credit', 'balance']];
   for (const t of transactions) {
@@ -43,19 +49,31 @@ const ResultsPage = ({ conversionData, onBackHome }) => {
     });
   };
 
-  const v = conversionData?.validation || {};
+  // Computed directly from the actual parsed transactions for this file,
+  // rather than trusted from the backend's own `validation` object — this
+  // keeps the card correct even if that field is stale or wrong upstream.
+  const transactions = conversionData?.transactions || [];
+  const transactionCount = transactions.length;
+  const totalCredits = transactions.reduce((sum, t) => sum + (t.credit || 0), 0);
+  const totalDebits  = transactions.reduce((sum, t) => sum + (t.debit  || 0), 0);
+
+  const openingBalance = conversionData?.openingBalance;
+  const closingBalance = conversionData?.closingBalance;
+
+  // A debit decreases the running balance, a credit increases it:
+  // opening - debits + credits should reconcile to the statement's own
+  // closing balance. null when either balance figure wasn't extracted,
+  // rendered as a neutral "Ready" badge rather than a false pass/fail.
+  let balanceVerified = null;
+  if (openingBalance != null && closingBalance != null) {
+    const computedClosing = openingBalance - totalDebits + totalCredits;
+    balanceVerified = Math.abs(computedClosing - closingBalance) < 0.05;
+  }
 
   const handleXeroClick = () => {
     toast({
       title: "🚧 This feature isn't implemented yet—but don't worry! You can request it in your next prompt! 🚀",
       description: "Xero affiliate integration needed."
-    });
-  };
-
-  const handleMercuryClick = () => {
-    toast({
-      title: "🚧 This feature isn't implemented yet—but don't worry! You can request it in your next prompt! 🚀",
-      description: "Mercury affiliate integration needed."
     });
   };
 
@@ -104,38 +122,38 @@ const ResultsPage = ({ conversionData, onBackHome }) => {
                 {conversionData?.originalFilename || 'Bank Statement'}
               </h3>
               <p className="text-sm text-gray-600">
-                {conversionData?.bank || 'Bank'} &bull; {v.transactionCount || 0} transactions
+                {conversionData?.bank || 'Bank'} &bull; {transactionCount} transaction{transactionCount === 1 ? '' : 's'}
                 {conversionData?.statementPeriod?.from && (
                   <> &bull; {conversionData.statementPeriod.from} – {conversionData.statementPeriod.to}</>
                 )}
               </p>
             </div>
             <div className="text-right">
-              {v.balanceChecks === true ? (
+              {balanceVerified === true ? (
                 <span className="inline-flex items-center gap-1 bg-green-100 text-green-800 text-xs font-semibold px-3 py-1 rounded-full">
                   <CheckCircle className="w-3 h-3" /> Balance verified
                 </span>
-              ) : v.balanceChecks === false ? (
+              ) : balanceVerified === false ? (
                 <span className="inline-flex items-center gap-1 bg-yellow-100 text-yellow-800 text-xs font-semibold px-3 py-1 rounded-full">
                   <AlertCircle className="w-3 h-3" /> Balance mismatch
                 </span>
               ) : (
-                <span className="inline-block bg-green-100 text-green-800 text-xs font-semibold px-3 py-1 rounded-full">
+                <span className="inline-block bg-gray-100 text-gray-700 text-xs font-semibold px-3 py-1 rounded-full">
                   Ready
                 </span>
               )}
             </div>
           </div>
 
-          {(v.sumCredits != null || v.sumDebits != null) && (
+          {transactionCount > 0 && (
             <div className="grid grid-cols-2 gap-3 mb-6 text-sm">
               <div className="bg-green-50 rounded-lg p-3">
                 <p className="text-gray-500 text-xs mb-1">Total Credits</p>
-                <p className="font-semibold text-green-700">${v.sumCredits?.toLocaleString('en-AU', { minimumFractionDigits: 2 })}</p>
+                <p className="font-semibold text-green-700">${totalCredits.toLocaleString('en-AU', { minimumFractionDigits: 2 })}</p>
               </div>
               <div className="bg-red-50 rounded-lg p-3">
                 <p className="text-gray-500 text-xs mb-1">Total Debits</p>
-                <p className="font-semibold text-red-700">${v.sumDebits?.toLocaleString('en-AU', { minimumFractionDigits: 2 })}</p>
+                <p className="font-semibold text-red-700">${totalDebits.toLocaleString('en-AU', { minimumFractionDigits: 2 })}</p>
               </div>
             </div>
           )}
@@ -186,28 +204,33 @@ const ResultsPage = ({ conversionData, onBackHome }) => {
               </Button>
             </motion.div>
 
-            {/* Mercury Card */}
+            {/* MYOB Card */}
+            {/* TODO: Replace PLACEHOLDER_MYOB_AFFILIATE_LINK with the real
+                MYOB affiliate/partner link once confirmed. Do not go live
+                with this card until that link is set. */}
             <motion.div
               whileHover={{ y: -5 }}
               className="bg-white rounded-xl shadow-lg p-6 border border-gray-200 hover:shadow-xl transition-all"
             >
               <div className="mb-4">
                 <div className="w-12 h-12 bg-purple-100 rounded-lg flex items-center justify-center mb-4">
-                  <span className="text-2xl">🏦</span>
+                  <span className="text-2xl">🧾</span>
                 </div>
                 <h3 className="text-xl font-bold text-[#1a2b48] mb-2">
-                  Switch to Mercury
+                  Import to MYOB
                 </h3>
                 <p className="text-gray-600 mb-4">
-                  Tired of manual bank feeds? Switch to Mercury Business Banking for automated reporting.
+                  Import your data to MYOB accounting software. Trusted by Australian accountants and bookkeepers.
                 </p>
               </div>
               <Button
-                onClick={handleMercuryClick}
+                asChild
                 className="w-full bg-purple-600 hover:bg-purple-700 text-white transition-all"
               >
-                Learn More
-                <ExternalLink className="w-4 h-4 ml-2" />
+                <a href={PROMO_LINKS.myob} target="_blank" rel="noopener noreferrer">
+                  Claim Offer
+                  <ExternalLink className="w-4 h-4 ml-2" />
+                </a>
               </Button>
             </motion.div>
           </div>
