@@ -41,6 +41,9 @@ SKIP_FIRST_WORDS = {
 }
 SKIP_EXACT = {
     'OPENING BALANCE', 'CLOSING BALANCE', 'Opening Balance', 'Closing Balance',
+    # ANZ's opening-balance marker: "BALANCE BROUGHT FORWARD" (word order
+    # differs from NAB's "Brought forward").
+    'BALANCE BROUGHT FORWARD',
 }
 # Some CBA statements print the marker as "<year> OPENING/CLOSING BALANCE"
 # (the year lands on the same row as the marker rather than in the date
@@ -59,6 +62,19 @@ MONTH_MAP = {
 # checking whether a word STARTS WITH a month name.
 _MONTH_KEYS_BY_LENGTH = sorted(set(MONTH_MAP.keys()), key=len, reverse=True)
 
+# Case-insensitive lookup — some banks (ANZ) render month abbreviations in
+# ALL CAPS ("OCT", "NOV") rather than the title case used by NAB/CBA.
+# MONTH_MAP itself stays title-case; only lookups go through this.
+MONTH_MAP_UPPER = {k.upper(): v for k, v in MONTH_MAP.items()}
+
+
+def _is_month_word(text):
+    return text.upper() in MONTH_MAP_UPPER
+
+
+def _month_value(text):
+    return MONTH_MAP_UPPER.get(text.upper())
+
 
 def _fused_month_prefix(text):
     """
@@ -67,9 +83,11 @@ def _fused_month_prefix(text):
     ("MayCANBERRA", "May2024") rather than as its own token, so pdfplumber
     extracts it as a single word. Returns (month_key, remainder) if text
     starts with a month name followed by more characters, else (None, text).
+    Matched case-insensitively (see MONTH_MAP_UPPER).
     """
+    upper_text = text.upper()
     for key in _MONTH_KEYS_BY_LENGTH:
-        if text.startswith(key) and len(text) > len(key):
+        if upper_text.startswith(key.upper()) and len(text) > len(key):
             return key, text[len(key):]
     return None, text
 
@@ -99,6 +117,18 @@ CLOSING_SUMMARY_LABEL_RE = re.compile(
 # through to the "Important information:" disclaimer that always follows it.
 INTEREST_SUMMARY_START_RE = re.compile(r'Debit\s+Interest\s+Rate\s+Summary', re.IGNORECASE)
 INTEREST_SUMMARY_END_RE   = re.compile(r'Important\s+information', re.IGNORECASE)
+
+# ── ANZ per-page running-totals footer row (single row, not a bounded block) ──
+# "TOTALS AT END OF PAGE $x,xxx.xx $x,xxx.xx" — sits inside the transaction
+# area on every ANZ transaction page. Its dollar-prefixed debit/credit
+# figures would otherwise be misclassified as a transaction's amounts.
+ANZ_PAGE_TOTALS_RE = re.compile(r'TOTALS\s+AT\s+END\s+OF\s+PAGE', re.IGNORECASE)
+
+# ── ANZ statement detection (for the gated continuation heuristic below) ────
+# Matched on specific multi-word phrases, not a bare "ANZ" substring — CBA's
+# own fixtures contain merchant text like "ALLIANZ INSURANCE", which a naive
+# substring check would false-positive on.
+ANZ_STATEMENT_RE = re.compile(r'Australia and New Zealand Banking Group|ANZ ONE STATEMENT')
 
 
 def detect_columns(page_words):
@@ -249,8 +279,8 @@ def parse_date(date_words, fallback_year=None):
                 day = f'{n:02d}'
             elif n > 31:
                 year = str(n)
-        elif t in MONTH_MAP:
-            month = MONTH_MAP[t]
+        elif _is_month_word(t):
+            month = _month_value(t)
 
     if not (day and month):
         return None
@@ -280,6 +310,10 @@ def group_words_by_row(page_words):
 
 def should_skip_row(row_words, columns):
     """Return True if this row should not produce a transaction."""
+    row_text_all = ' '.join(w['text'] for w in row_words)
+    if ANZ_PAGE_TOTALS_RE.search(row_text_all):
+        return True
+
     desc_words = [w for w in row_words
                   if classify_word(w, columns) == 'description']
     all_words  = [w for w in row_words
@@ -296,7 +330,7 @@ def should_skip_row(row_words, columns):
 
         date_zone = [w for w in row_words if classify_word(w, columns) == 'date']
         has_day   = any(w['text'].isdigit() and 1 <= int(w['text']) <= 31 for w in date_zone)
-        has_month = any(w['text'] in MONTH_MAP for w in date_zone)
+        has_month = any(_is_month_word(w['text']) for w in date_zone)
 
         # Check combined text of first few words
         desc_texts = [w['text'] for w in desc_words[:3]]
@@ -325,7 +359,7 @@ def is_transaction_open_row(row_words, columns):
 
     has_day   = any(w['text'].isdigit() and 1 <= int(w['text']) <= 31
                     for w in date_zone)
-    has_month = any(w['text'] in MONTH_MAP
+    has_month = any(_is_month_word(w['text'])
                     for w in date_zone + desc_zone[:2])
 
     if has_day and not has_month:
@@ -344,7 +378,7 @@ def extract_date_from_row(row_words, columns, fallback_year=None):
                   if classify_word(w, columns) == 'description']
     date_texts = [w['text'] for w in date_words]
 
-    if not any(t in MONTH_MAP for t in date_texts):
+    if not any(_is_month_word(t) for t in date_texts):
         # Month may be fused onto the first description word with no space
         # (see _fused_month_prefix) instead of appearing in the date column.
         for w in desc_words[:2]:
@@ -360,7 +394,7 @@ def extract_description_from_row(row_words, columns):
     """Join description column words, skip dot-leader artifacts."""
     date_zone = [w for w in row_words if classify_word(w, columns) == 'date']
     has_day   = any(w['text'].isdigit() and 1 <= int(w['text']) <= 31 for w in date_zone)
-    has_month = any(w['text'] in MONTH_MAP for w in date_zone)
+    has_month = any(_is_month_word(w['text']) for w in date_zone)
     strip_fused_month = has_day and not has_month
 
     words = sorted(
@@ -489,6 +523,9 @@ def parse_pdf(pdf_bytes):
     current_year = doc_year if doc_year else datetime.now().year
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        first_page_text = pdf.pages[0].extract_text() or ''
+        is_anz = bool(ANZ_STATEMENT_RE.search(first_page_text))
+
         for page in pdf.pages:
             words = page.extract_words(x_tolerance=3, y_tolerance=3)
 
@@ -526,6 +563,23 @@ def parse_pdf(pdf_bytes):
                 classified = [w for w in row_words
                               if classify_word(w, columns) is not None]
                 if not classified:
+                    continue
+
+                # ANZ year-rollover marker: a bare year on its own row (no
+                # day, no month) — e.g. "2026" with "blank" placeholders in
+                # the amount columns. Prints once at document start and
+                # again whenever the statement crosses a calendar-year
+                # boundary. ANZ transaction rows never carry their own year
+                # (only day + month), so if this row isn't read here,
+                # current_year silently goes stale and every date after
+                # the rollover is mis-dated.
+                date_zone = [w for w in row_words if classify_word(w, columns) == 'date']
+                other_classified = [w for w in row_words
+                                     if classify_word(w, columns) not in (None, 'date')]
+                if (len(date_zone) == 1
+                        and re.fullmatch(r'20\d{2}', date_zone[0]['text'])
+                        and all(w['text'].strip().lower() == 'blank' for w in other_classified)):
+                    current_year = int(date_zone[0]['text'])
                     continue
 
                 row_text_all = ' '.join(w['text'] for w in row_words)
@@ -606,17 +660,28 @@ def parse_pdf(pdf_bytes):
                         if already_complete:
                             row_debit, row_credit = extract_amount_from_row(row_words, columns)
                             has_row_amount = row_debit is not None or row_credit is not None
-                            # CBA's "Value Date: DD/MM/YYYY" line is the one known
-                            # legitimate trailing continuation of an already-complete
-                            # transaction; it never carries its own amount.
-                            is_trailing_metadata = 'Value Date:' in row_text_all
-                            if has_row_amount or not is_trailing_metadata:
-                                # current_tx already has its amount — this row is a
-                                # separate same-day transaction that doesn't repeat
-                                # the date column (NAB layout), or the first line of
-                                # one wrapped across multiple lines. Either way it
-                                # isn't more continuation text for current_tx.
-                                opens_new = True
+                            if is_anz:
+                                # ANZ always places the amount on the row that
+                                # opens the transaction, then wraps extra
+                                # description text below it (plain merchant
+                                # detail, or "EFFECTIVE DATE DD MMM YYYY") —
+                                # never a fresh row of its own. Only a row
+                                # carrying its own amount can start a new
+                                # transaction here.
+                                if has_row_amount:
+                                    opens_new = True
+                            else:
+                                # CBA's "Value Date: DD/MM/YYYY" line is the one known
+                                # legitimate trailing continuation of an already-complete
+                                # transaction; it never carries its own amount.
+                                is_trailing_metadata = 'Value Date:' in row_text_all
+                                if has_row_amount or not is_trailing_metadata:
+                                    # current_tx already has its amount — this row is a
+                                    # separate same-day transaction that doesn't repeat
+                                    # the date column (NAB layout), or the first line of
+                                    # one wrapped across multiple lines. Either way it
+                                    # isn't more continuation text for current_tx.
+                                    opens_new = True
                     elif current_date is not None:
                         # current_tx was cleared at a page boundary (flushed at
                         # the previous page's end-of-page, or discarded after a

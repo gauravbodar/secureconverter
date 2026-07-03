@@ -5,3 +5,4 @@ parser/tests/fixtures/cba_your_statement.pdf
 parser/tests/fixtures/nab_business.pdf
 parser/tests/fixtures/cba_dr_excursion.pdf
 parser/tests/fixtures/nab_multi_page_break.pdf
+parser/tests/fixtures/ANZ sample.pdf

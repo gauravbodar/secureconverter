@@ -15,6 +15,7 @@ FIXTURES = {
     'nab_page_break':     'tests/fixtures/nab_multi_page_break.pdf',
     'cba_dr_excursion':   'tests/fixtures/cba_dr_excursion.pdf',
     'cba_full_overdraft': 'tests/fixtures/cba_full_overdraft.pdf',
+    'anz_sample':         'tests/fixtures/ANZ sample.pdf',
 }
 
 def load(key):
@@ -564,6 +565,91 @@ class TestCBAFullOverdraft:
             for month in ('May',):
                 assert not re.match(rf'^{month}[A-Z]', desc), \
                     f"Fused month prefix leaked into description: {desc!r}"
+
+    def test_debit_and_credit_separate(self):
+        debits  = [t for t in self.txns if t['debit']  is not None]
+        credits = [t for t in self.txns if t['credit'] is not None]
+        assert len(debits)  > 0
+        assert len(credits) > 0
+
+    def test_amounts_never_both_set(self):
+        both = [t for t in self.txns
+                if t['debit'] is not None and t['credit'] is not None]
+        assert len(both) == 0, \
+            f"{len(both)} rows have both debit and credit set"
+
+
+# ── ANZ ONE Statement (16 pages, 12 transaction pages, ALL-CAPS months) ──────
+
+class TestANZStatement:
+    def setup_method(self):
+        self.pdf  = load('anz_sample')
+        self.txns = parse_pdf(self.pdf)
+
+    def test_contract(self):
+        assert_contract(self.txns, 'ANZ-Sample')
+
+    def test_row_count_exact(self):
+        assert len(self.txns) == 298, f"Expected exactly 298, got {len(self.txns)}"
+
+    def test_total_debits_and_credits(self):
+        sum_debits  = round(sum(t['debit']  or 0 for t in self.txns), 2)
+        sum_credits = round(sum(t['credit'] or 0 for t in self.txns), 2)
+        assert abs(sum_debits  - 475591.10) < 0.02, f"sum debits {sum_debits}"
+        assert abs(sum_credits - 523864.31) < 0.02, f"sum credits {sum_credits}"
+
+    def test_balance_chain_reconciles_to_closing_balance(self):
+        closing = assert_balance_chain(self.txns, opening_balance=21202.59,
+                                        label='ANZ-Sample')
+        assert abs(closing - 69475.80) < 0.02, \
+            f"Final balance {closing}, expected 69475.80"
+
+    def test_opening_balance_row_excluded(self):
+        """"BALANCE BROUGHT FORWARD" (ANZ's opening-balance marker, word
+        order differs from NAB's "Brought forward") must not appear as a
+        transaction of its own."""
+        assert not any(
+            'BROUGHT FORWARD' in (t['description'] or '').upper()
+            for t in self.txns
+        ), "BALANCE BROUGHT FORWARD marker leaked through as a transaction"
+
+    def test_no_page_totals_leak(self):
+        """The per-page "TOTALS AT END OF PAGE" footer row (present on all
+        12 transaction pages) must never surface as its own transaction —
+        its dollar-prefixed debit/credit figures previously got absorbed
+        into a phantom row once per page."""
+        for t in self.txns:
+            assert 'TOTALS AT END OF PAGE' not in (t['description'] or '').upper(), \
+                f"Per-page totals footer leaked as a transaction: {t}"
+
+    def test_no_null_balance_rows(self):
+        """Every genuine ANZ transaction row carries its own balance. A
+        None here is the fingerprint of a phantom row (the opening-balance
+        marker or a TOTALS-row artifact) that should have been excluded —
+        a pure count check, since a wrong exclusion could otherwise net
+        out to the right sums by coincidence."""
+        null_balance = [t for t in self.txns if t['balance'] is None]
+        assert len(null_balance) == 0, \
+            f"{len(null_balance)} rows have no balance: {null_balance}"
+
+    def test_year_rollover_across_calendar_boundary(self):
+        """ANZ transaction rows never carry their own year (only day +
+        month, e.g. "02 JAN") — the statement instead prints a bare-year
+        marker row once at the start and again at each Dec->Jan boundary.
+        Both years must be present and every date must fall within the
+        statement's actual Oct-2025-to-Apr-2026 span, not stuck at the
+        opening year throughout."""
+        years = {t['date'][:4] for t in self.txns if t['date']}
+        assert years == {'2025', '2026'}, f"Expected both statement years, got {years}"
+        assert self.txns[0]['date']  == '2025-10-30'
+        assert self.txns[-1]['date'] == '2026-04-28'
+
+    def test_all_caps_months_parsed(self):
+        """Core Phase 1 finding: ANZ renders month abbreviations in ALL
+        CAPS ("OCT", "NOV"), which the shared MONTH_MAP lookup must match
+        case-insensitively without altering NAB/CBA's title-case keys."""
+        assert len(self.txns) > 0
+        assert all(t['date'] for t in self.txns), "Some transactions have no date at all"
 
     def test_debit_and_credit_separate(self):
         debits  = [t for t in self.txns if t['debit']  is not None]
