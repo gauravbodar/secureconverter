@@ -2,18 +2,19 @@
 Test suite for universal_parser.py
 Run from parser/ directory: python3 -m pytest tests/test_universal.py -v
 """
-import pytest, csv, io, sys, os
+import pytest, csv, io, sys, os, re
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import pdfplumber
 from universal_parser import parse_pdf, parse_to_csv, extract_document_year
 from app import compute_balance_valid, extract_header_info
 
 FIXTURES = {
-    'cba_summary':      'tests/fixtures/cba_transaction_summary.pdf',
-    'cba_statement':    'tests/fixtures/cba_your_statement.pdf',
-    'nab_business':     'tests/fixtures/nab_business.pdf',
-    'nab_page_break':   'tests/fixtures/nab_multi_page_break.pdf',
-    'cba_dr_excursion': 'tests/fixtures/cba_dr_excursion.pdf',
+    'cba_summary':        'tests/fixtures/cba_transaction_summary.pdf',
+    'cba_statement':      'tests/fixtures/cba_your_statement.pdf',
+    'nab_business':       'tests/fixtures/nab_business.pdf',
+    'nab_page_break':     'tests/fixtures/nab_multi_page_break.pdf',
+    'cba_dr_excursion':   'tests/fixtures/cba_dr_excursion.pdf',
+    'cba_full_overdraft': 'tests/fixtures/cba_full_overdraft.pdf',
 }
 
 def load(key):
@@ -471,6 +472,98 @@ class TestCBADRExcursion:
         assert abs(t['debit'] - 119.00) < 0.01
         assert abs(t['balance'] - 1530.74) < 0.01
         assert t['date'] == '2025-09-30'
+
+    def test_debit_and_credit_separate(self):
+        debits  = [t for t in self.txns if t['debit']  is not None]
+        credits = [t for t in self.txns if t['credit'] is not None]
+        assert len(debits)  > 0
+        assert len(credits) > 0
+
+    def test_amounts_never_both_set(self):
+        both = [t for t in self.txns
+                if t['debit'] is not None and t['credit'] is not None]
+        assert len(both) == 0, \
+            f"{len(both)} rows have both debit and credit set"
+
+
+# ── CBA "Your Statement" in overdraft (DR) for the ENTIRE statement ─────────
+# Regression coverage for BUG 5: this real-world PDF's text layer fuses the
+# month name directly onto the following word with no space ("MayCANBERRA",
+# "May2024") on every real transaction row across all 3 transaction pages —
+# is_transaction_open_row's exact-equality month check never matched, so
+# opens_new was never True and the entire real transaction table (42 rows)
+# silently vanished, while a handful of unfused footer rows (closing balance,
+# debit-interest-rate-summary table) leaked through as phantom transactions.
+# Also covers the smaller, separate gap: "2024 CLOSING BALANCE" wasn't
+# excluded because SKIP_EXACT only hardcoded the '2025 ...' variant.
+
+class TestCBAFullOverdraft:
+    def setup_method(self):
+        self.pdf  = load('cba_full_overdraft')
+        self.txns = parse_pdf(self.pdf)
+
+    def test_contract(self):
+        assert_contract(self.txns, 'CBA-FullOverdraft')
+
+    def test_document_year(self):
+        assert extract_document_year(self.pdf) == 2024
+
+    def test_row_count_exact(self):
+        assert len(self.txns) == 42, f"Expected exactly 42, got {len(self.txns)}"
+
+    def test_total_debits_and_credits(self):
+        sum_debits  = round(sum(t['debit']  or 0 for t in self.txns), 2)
+        sum_credits = round(sum(t['credit'] or 0 for t in self.txns), 2)
+        assert abs(sum_debits  - 24695.46) < 0.02, f"sum debits {sum_debits}"
+        assert abs(sum_credits - 26928.00) < 0.02, f"sum credits {sum_credits}"
+
+    def test_debit_and_credit_row_counts(self):
+        debits  = [t for t in self.txns if t['debit']  is not None]
+        credits = [t for t in self.txns if t['credit'] is not None]
+        assert len(debits)  == 38, f"Expected 38 debit rows, got {len(debits)}"
+        assert len(credits) == 4,  f"Expected 4 credit rows, got {len(credits)}"
+
+    def test_balance_chain_reconciles_to_closing_balance(self):
+        closing = assert_balance_chain(self.txns, opening_balance=-13580.01,
+                                        label='CBA-FullOverdraft')
+        assert abs(closing - (-11347.47)) < 0.02, \
+            f"Final balance {closing}, expected -11347.47 (11,347.47 Dr)"
+
+    def test_opening_and_closing_balances_negative(self):
+        first_bal = self.txns[0]['balance']
+        last_bal  = self.txns[-1]['balance']
+        assert first_bal is not None and first_bal < 0, \
+            "First transaction balance must be negative (account opens DR)"
+        assert last_bal is not None and last_bal < 0, \
+            "Last transaction balance must be negative (account closes DR)"
+        assert abs(last_bal - (-11347.47)) < 0.02
+
+    def test_closing_balance_not_a_transaction(self):
+        assert not any(
+            'CLOSING' in (t['description'] or '').upper()
+            and t['debit'] is None and t['credit'] is None
+            for t in self.txns
+        ), "CLOSING BALANCE marker leaked through as a transaction"
+
+    def test_no_interest_rate_summary_leak(self):
+        for t in self.txns:
+            desc = (t['description'] or '')
+            assert 'Your limit is now' not in desc, \
+                f"Fabricated interest-summary row leaked: {t}"
+            assert 'Excess debit interest rate' not in desc, \
+                f"Fabricated interest-summary row leaked: {t}"
+            assert 'Debit Interest Rate Summary' not in desc
+            assert 'Interest Rate' not in desc
+            assert '(p.a.)' not in desc
+
+    def test_no_month_fusion_artifact_in_description(self):
+        # "MayCANBERRA", "MayDirect" etc. must not survive into output —
+        # the fused month prefix should be stripped, not just tolerated.
+        for t in self.txns:
+            desc = t['description'] or ''
+            for month in ('May',):
+                assert not re.match(rf'^{month}[A-Z]', desc), \
+                    f"Fused month prefix leaked into description: {desc!r}"
 
     def test_debit_and_credit_separate(self):
         debits  = [t for t in self.txns if t['debit']  is not None]

@@ -40,9 +40,12 @@ SKIP_FIRST_WORDS = {
     'Note:', 'Name:',
 }
 SKIP_EXACT = {
-    'OPENING BALANCE', 'CLOSING BALANCE', '2025 OPENING BALANCE',
-    '2025 CLOSING BALANCE', 'Opening Balance', 'Closing Balance',
+    'OPENING BALANCE', 'CLOSING BALANCE', 'Opening Balance', 'Closing Balance',
 }
+# Some CBA statements print the marker as "<year> OPENING/CLOSING BALANCE"
+# (the year lands on the same row as the marker rather than in the date
+# column) — matches any year, not just one hardcoded statement's.
+_BALANCE_MARKER_RE = re.compile(r'^\d{4}\s+(OPENING|CLOSING)\s+BALANCE$', re.IGNORECASE)
 
 MONTH_MAP = {
     'Jan':'01','Feb':'02','Mar':'03','Apr':'04','May':'05','Jun':'06',
@@ -51,6 +54,24 @@ MONTH_MAP = {
     'October':'10','November':'11','December':'12','January':'01',
     'February':'02','March':'03','April':'04','May':'05',
 }
+
+# Longest name first so "June"/"July" aren't truncated to "Jun"/"Jul" when
+# checking whether a word STARTS WITH a month name.
+_MONTH_KEYS_BY_LENGTH = sorted(set(MONTH_MAP.keys()), key=len, reverse=True)
+
+
+def _fused_month_prefix(text):
+    """
+    Some real-world CBA "Your Statement" PDFs render the month name fused
+    directly onto the following word with no space in the text layer
+    ("MayCANBERRA", "May2024") rather than as its own token, so pdfplumber
+    extracts it as a single word. Returns (month_key, remainder) if text
+    starts with a month name followed by more characters, else (None, text).
+    """
+    for key in _MONTH_KEYS_BY_LENGTH:
+        if text.startswith(key) and len(text) > len(key):
+            return key, text[len(key):]
+    return None, text
 
 # ── Dots-only text (NAB visual separator artifact) ──────────────────────────
 DOTS_RE = re.compile(r'^[.\s]+$')
@@ -68,6 +89,16 @@ CLOSING_SUMMARY_LABEL_RE = re.compile(
     r'Opening\s+balance\s*-\s*Total\s+debits\s*\+\s*Total\s+credits\s*=\s*Closing\s+balance',
     re.IGNORECASE
 )
+
+# ── CBA "Your Statement" debit-interest-rate summary footer (bounded) ──────
+# A "Your Debit Interest Rate Summary" label followed by a rate-tier table
+# (header row, threshold/percentage rows) — not transactions. Its rows'
+# amount-shaped values (credit limit, excess-rate threshold) would otherwise
+# be misclassified as debit/credit figures by raw x-position, and its own
+# "31 <Month> ..." rows can look like transaction-opening rows. Bracketed
+# through to the "Important information:" disclaimer that always follows it.
+INTEREST_SUMMARY_START_RE = re.compile(r'Debit\s+Interest\s+Rate\s+Summary', re.IGNORECASE)
+INTEREST_SUMMARY_END_RE   = re.compile(r'Important\s+information', re.IGNORECASE)
 
 
 def detect_columns(page_words):
@@ -262,9 +293,20 @@ def should_skip_row(row_words, columns):
         first = desc_words[0]['text']
         if first in SKIP_FIRST_WORDS:
             return True
+
+        date_zone = [w for w in row_words if classify_word(w, columns) == 'date']
+        has_day   = any(w['text'].isdigit() and 1 <= int(w['text']) <= 31 for w in date_zone)
+        has_month = any(w['text'] in MONTH_MAP for w in date_zone)
+
         # Check combined text of first few words
-        combined = ' '.join(w['text'] for w in desc_words[:3])
-        if combined in SKIP_EXACT:
+        desc_texts = [w['text'] for w in desc_words[:3]]
+        if has_day and not has_month:
+            # Month may be fused onto this word with no space
+            # ("May2024 OPENING BALANCE") — strip it so the marker
+            # comparison below isn't defeated by the fusion artifact.
+            _, desc_texts[0] = _fused_month_prefix(desc_texts[0])
+        combined = ' '.join(desc_texts)
+        if combined in SKIP_EXACT or _BALANCE_MARKER_RE.match(combined):
             return True
 
     return False
@@ -286,6 +328,11 @@ def is_transaction_open_row(row_words, columns):
     has_month = any(w['text'] in MONTH_MAP
                     for w in date_zone + desc_zone[:2])
 
+    if has_day and not has_month:
+        # Month may be fused onto the following word with no space
+        # (see _fused_month_prefix) rather than appearing as its own token.
+        has_month = any(_fused_month_prefix(w['text'])[0] for w in desc_zone[:2])
+
     return has_day and has_month
 
 
@@ -293,23 +340,46 @@ def extract_date_from_row(row_words, columns, fallback_year=None):
     """Pull date column words and parse them."""
     date_words = [w for w in row_words
                   if classify_word(w, columns) == 'date']
+    desc_words = [w for w in row_words
+                  if classify_word(w, columns) == 'description']
     date_texts = [w['text'] for w in date_words]
+
+    if not any(t in MONTH_MAP for t in date_texts):
+        # Month may be fused onto the first description word with no space
+        # (see _fused_month_prefix) instead of appearing in the date column.
+        for w in desc_words[:2]:
+            month_key, _ = _fused_month_prefix(w['text'])
+            if month_key:
+                date_texts.append(month_key)
+                break
+
     return parse_date(date_texts, fallback_year=fallback_year)
 
 
 def extract_description_from_row(row_words, columns):
     """Join description column words, skip dot-leader artifacts."""
+    date_zone = [w for w in row_words if classify_word(w, columns) == 'date']
+    has_day   = any(w['text'].isdigit() and 1 <= int(w['text']) <= 31 for w in date_zone)
+    has_month = any(w['text'] in MONTH_MAP for w in date_zone)
+    strip_fused_month = has_day and not has_month
+
     words = sorted(
         (w for w in row_words if classify_word(w, columns) == 'description'),
         key=lambda w: w['x0']
     )
     parts = []
-    for w in words:
-        if DOTS_RE.match(w['text']):
+    for i, w in enumerate(words):
+        word_text = w['text']
+        if i == 0 and strip_fused_month:
+            # Month may be fused onto this word with no space
+            # ("MayCANBERRA AIRPORT...") — strip it before it leaks into
+            # the merchant description text.
+            _, word_text = _fused_month_prefix(word_text)
+        if DOTS_RE.match(word_text):
             continue
         # Dot-leaders are often fused directly onto a word with no
         # whitespace (e.g. "Canberra.............."), not their own token.
-        cleaned = re.sub(r'\.{3,}', '', w['text']).strip()
+        cleaned = re.sub(r'\.{3,}', '', word_text).strip()
         if cleaned:
             parts.append(cleaned)
     text = ' '.join(parts)
@@ -438,6 +508,9 @@ def parse_pdf(pdf_bytes):
             # NAB pages may contain a bounded fee-breakdown sub-table
             # (TRANSACTION SUMMARY ... Total Fees Charged) — not transactions.
             in_fee_table = False
+            # CBA "Your Statement" pages may contain a bounded debit-interest
+            # rate-summary footer table — not transactions.
+            in_interest_summary = False
             # CBA "Your Statement" closing reconciliation block: the label
             # row is matched by content, then its values row (no date, no
             # reliable column alignment) is skipped unconditionally.
@@ -463,6 +536,15 @@ def parse_pdf(pdf_bytes):
 
                 if CLOSING_SUMMARY_LABEL_RE.search(row_text_all):
                     skip_next_row = True
+                    continue
+
+                if in_interest_summary:
+                    if INTEREST_SUMMARY_END_RE.search(row_text_all):
+                        in_interest_summary = False
+                    continue
+
+                if INTEREST_SUMMARY_START_RE.search(row_text_all):
+                    in_interest_summary = True
                     continue
 
                 if in_fee_table:
